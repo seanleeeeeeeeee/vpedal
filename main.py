@@ -942,9 +942,9 @@ def draw_topdown(cfg, zones, engine, feet, cov, show_cov, px=900):
         txt(img, f"{'M' if f['mono'] else ''}{f['z_mm']:.0f}mm", (x + 12, y + 4),
             col=(255, 255, 255), rel=0.022)
     names = ",".join(sorted(z["note"] for z in zones if z["midi"] in engine.active))
-    txt(img, f"ACTIVE: {names}", (8, H - 12), rel=0.028, col=(0, 255, 120))
+	txt(img, f"ACTIVE: {names}", (8, H - 12), rel=0.028, col=(0, 255, 120))
 	if len(feet) == 1 and not feet[0]["mono"]:
-        f = feet[0]
+    	f = feet[0]
         txt(img, f"z0 {f['z0_mm']:+6.1f}  z1 {f['z1_mm']:+6.1f}  "
                  f"d {f['z0_mm']-f['z1_mm']:+6.1f} mm", (8, H - 34),
             rel=0.028, col=(255, 200, 0))
