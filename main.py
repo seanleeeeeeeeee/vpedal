@@ -41,13 +41,14 @@ DEFAULT_CFG = {
     },
     "board": {"width_m": 1.2981, "depth_m": 0.6501},   # = 129.81 x 65.01 cm
     "cameras": {
-        "cam0": {"pos_m": [0.03444, 0.0, 0.07], "yaw_deg": 45.0, "pitch_deg": 26.0,
+        "cam0": {"pos_m": [0.03444, 0.0, 0.070], "yaw_deg": 45.0,
+                 "pitch_deg": 26.0, "pitch_trim_deg": 0.0, "roll_deg": 0.0,
                  "hfov_deg": 62.2, "k1": 0.0, "k2": 0.0, "ppx": 0.0, "ppy": 0.0},
-        # cam1 x = board_width - 0.03444 by symmetry -- MEASURE IT, and if your ribbon
-        # is short, put the real x here and pull "x_cutoff_cm" down to match.
-        "cam1": {"pos_m": [1.26366, 0.0, 0.07], "yaw_deg": 135.0, "pitch_deg": 26.0,
+        "cam1": {"pos_m": [1.26366, 0.0, 0.070], "yaw_deg": 135.0,
+                 "pitch_deg": 26.0, "pitch_trim_deg": 0.0, "roll_deg": 0.0,
                  "hfov_deg": 62.2, "k1": 0.0, "k2": 0.0, "ppx": 0.0, "ppy": 0.0}
     },
+    "view": {"fov_link": 1, "calib_solve_fov": 1},
     "detect": {
         "diff_thresh": 40, "rel_thresh_pct": 8, "blur_k": 5,
         "open_k": 3, "close_k": 5, "min_area": 120, "max_area": 30000,
@@ -129,37 +130,50 @@ def wrap_pi(a):
 
 
 class CamGeom:
-    """Pinhole + 2-term radial.  Handles pixel<->world bearing/elevation."""
+    """Pinhole + 2-term radial + roll.  pixel <-> world bearing/elevation."""
 
     def __init__(self, c, proc_size):
         self.C = np.array(c["pos_m"], float)
         self.yaw = math.radians(c["yaw_deg"])
-        self.pitch = math.radians(c["pitch_deg"])        # positive = nose down
-        self.hfov = math.radians(c["hfov_deg"])
+        self.pitch = math.radians(c["pitch_deg"] + c.get("pitch_trim_deg", 0.0))
+        self.roll = math.radians(c.get("roll_deg", 0.0))
         self.k1, self.k2 = float(c["k1"]), float(c["k2"])
         self.W, self.H = proc_size
-        self.f = (self.W / 2.0) / math.tan(self.hfov / 2.0)
         self.cx = (self.W - 1) / 2.0 + c["ppx"]
         self.cy = (self.H - 1) / 2.0 + c["ppy"]
+        self.set_hfov(math.radians(c["hfov_deg"]))
         self._axes()
+
+    def set_hfov(self, hfov):
+        self.hfov = hfov
+        self.f = (self.W / 2.0) / math.tan(hfov / 2.0)
 
     def _axes(self):
         cy, sy = math.cos(self.yaw), math.sin(self.yaw)
         cp, sp = math.cos(self.pitch), math.sin(self.pitch)
-        F = np.array([cy * cp, sy * cp, -sp])            # forward
-        R = np.array([sy, -cy, 0.0])                     # camera right
-        U = np.cross(R, F)                               # camera up
-        self.M = np.vstack([R, U, F])                    # rows R,U,F  (world<-cam)
+        F = np.array([cy * cp, sy * cp, -sp])
+        R0 = np.array([sy, -cy, 0.0])
+        U0 = np.cross(R0, F)
+        cr, sr = math.cos(self.roll), math.sin(self.roll)
+        R = R0 * cr - U0 * sr                     # +roll = camera rolls clockwise
+        U = U0 * cr + R0 * sr
+        self.M = np.vstack([R, U, F])             # rows R,U,F (world <- cam)
+        # world-DOWN expressed in image axes -> used to find the true lowest pixel
+        self.down_img = (sr, cr)
 
-    def set_pose(self, yaw, pitch, C):
-        self.yaw, self.pitch, self.C = yaw, pitch, np.asarray(C, float)
+    def set_pose(self, yaw, pitch, roll, C):
+        self.yaw, self.pitch, self.roll = yaw, pitch, roll
+        self.C = np.asarray(C, float)
         self._axes()
 
     def clone_params(self, p):
+        """p = [yaw, pitch, roll, x, y, z, f]"""
         g = object.__new__(CamGeom)
         g.__dict__.update(self.__dict__)
-        g.C = np.array([p[2], p[3], p[4]])
-        g.yaw, g.pitch = p[0], p[1]
+        g.yaw, g.pitch, g.roll = p[0], p[1], p[2]
+        g.C = np.array(p[3:6], float)
+        g.f = max(50.0, p[6])
+        g.hfov = 2.0 * math.atan((g.W / 2.0) / g.f)
         g._axes()
         return g
 
@@ -332,7 +346,8 @@ class Detector:
         """Keep pixels whose ray pierces the play volume. Cached by param signature."""
         d, lim, brd = cfg["detect"], cfg["limits"], cfg["board"]
         sig = (d["roi_margin_cm"], d["roi_zmax_cm"], lim["x_cutoff_cm"],
-               round(self.g.yaw, 6), round(self.g.pitch, 6), tuple(self.g.C))
+               round(self.g.yaw, 6), round(self.g.pitch, 6), round(self.g.roll, 6),
+               round(self.g.f, 4), tuple(np.round(self.g.C, 6)))
         if sig == self._sig:
             return
         self._sig = sig
@@ -592,77 +607,119 @@ class NoteEngine:
                 self.send(m, False)
 
 
-# --------------------------------------------------------------------------- UI
-SLIDERS = [
-    ("Diff thresh", ("detect", "diff_thresh"), 1, 120, 1),
-    ("Rel thresh %", ("detect", "rel_thresh_pct"), 0, 40, 1),
-    ("Blur k", ("detect", "blur_k"), 1, 15, 2),
-    ("Open k", ("detect", "open_k"), 1, 15, 2),
-    ("Close k", ("detect", "close_k"), 1, 25, 2),
-    ("Min area px", ("detect", "min_area"), 20, 4000, 10),
-    ("Max area px", ("detect", "max_area"), 1000, 60000, 500),
-    ("Band px", ("detect", "band_px"), 1, 15, 1),
-    ("Contact mm", ("detect", "z_contact_mm"), 0, 80, 1),
-    ("Pair tol mm", ("detect", "z_pair_tol_mm"), 5, 200, 5),
-    ("Snap mm", ("detect", "snap_mm"), 0, 40, 1),
-    ("On frames", ("detect", "on_frames"), 1, 8, 1),
-    ("Off frames", ("detect", "off_frames"), 1, 15, 1),
-    ("Mono on frm", ("detect", "mono_on_frames"), 1, 12, 1),
-    ("Mono enable", ("detect", "mono_enable"), 0, 1, 1),
-    ("X cutoff cm", ("limits", "x_cutoff_cm"), 20, 135, 1),
-    ("ROI margin cm", ("detect", "roi_margin_cm"), 0, 30, 1),
-    ("ROI z max cm", ("detect", "roi_zmax_cm"), 5, 60, 1),
-    ("Zone dx mm", ("zones", "zone_dx_mm"), -150, 150, 1),
-    ("Zone dy mm", ("zones", "zone_dy_mm"), -150, 150, 1),
-]
+# --------------------------------------------------------------------------- U
 
 
 def cfg_get(cfg, path):
-    return cfg[path[0]][path[1]]
-
-
+    node = cfg
+    for p in path:
+        node = node[p]
+    return node
 def cfg_set(cfg, path, v):
-    cfg[path[0]][path[1]] = int(v)
+    node = cfg
+    for p in path[:-1]:
+        node = node[p]
+    node[path[-1]] = v
+    
+def _H(t):
+    return (t, None, 0, 0, 0, 0, 1.0)
 
+SLIDERS = [
+    _H("- DETECT -"),
+    ("Diff thresh",    ("detect", "diff_thresh"),      1, 120, 1, 0, 1.0),
+    ("Rel thresh %",   ("detect", "rel_thresh_pct"),   0, 40, 1, 0, 1.0),
+    ("Blur k",         ("detect", "blur_k"),           1, 15, 2, 0, 1.0),
+    ("Open k",         ("detect", "open_k"),           1, 15, 2, 0, 1.0),
+    ("Close k",        ("detect", "close_k"),          1, 25, 2, 0, 1.0),
+    ("Min area px",    ("detect", "min_area"),        20, 4000, 10, 0, 1.0),
+    ("Max area px",    ("detect", "max_area"),      1000, 60000, 500, 0, 1.0),
+    ("Band px",        ("detect", "band_px"),          1, 15, 1, 0, 1.0),
+    _H("- GATES / TIMING -"),
+    ("Contact mm",     ("detect", "z_contact_mm"),     0, 80, 1, 0, 1.0),
+    ("Pair tol mm",    ("detect", "z_pair_tol_mm"),    5, 200, 5, 0, 1.0),
+    ("Snap mm",        ("detect", "snap_mm"),          0, 40, 1, 0, 1.0),
+    ("On frames",      ("detect", "on_frames"),        1, 8, 1, 0, 1.0),
+    ("Off frames",     ("detect", "off_frames"),       1, 15, 1, 0, 1.0),
+    ("Mono on frm",    ("detect", "mono_on_frames"),   1, 12, 1, 0, 1.0),
+    ("Mono enable",    ("detect", "mono_enable"),      0, 1, 1, 0, 1.0),
+    _H("- AREA / ZONES -"),
+    ("X cutoff cm",    ("limits", "x_cutoff_cm"),     20, 135, 1, 0, 1.0),
+    ("ROI margin cm",  ("detect", "roi_margin_cm"),    0, 30, 1, 0, 1.0),
+    ("ROI z max cm",   ("detect", "roi_zmax_cm"),      5, 60, 1, 0, 1.0),
+    ("Zone dx mm",     ("zones", "zone_dx_mm"),     -150, 150, 1, 0, 1.0),
+    ("Zone dy mm",     ("zones", "zone_dy_mm"),     -150, 150, 1, 0, 1.0),
+    _H("- OPTICS / POSE -"),
+    ("FOV c0 deg",     ("cameras", "cam0", "hfov_deg"),       45.0, 130.0, 0.1, 1, 1.0),
+    ("FOV c1 deg",     ("cameras", "cam1", "hfov_deg"),       45.0, 130.0, 0.1, 1, 1.0),
+    ("FOV link",       ("view", "fov_link"),                     0, 1, 1, 0, 1.0),
+    ("Pitch trim c0",  ("cameras", "cam0", "pitch_trim_deg"), -6.0, 6.0, 0.05, 2, 1.0),
+    ("Pitch trim c1",  ("cameras", "cam1", "pitch_trim_deg"), -6.0, 6.0, 0.05, 2, 1.0),
+    ("Roll c0 deg",    ("cameras", "cam0", "roll_deg"),       -8.0, 8.0, 0.05, 2, 1.0),
+    ("Roll c1 deg",    ("cameras", "cam1", "roll_deg"),       -8.0, 8.0, 0.05, 2, 1.0),
+    ("Cam0 height mm", ("cameras", "cam0", "pos_m", 2),       30.0, 150.0, 0.5, 1, 0.001),
+    # ("Cam1 height mm", ("cameras","cam1","pos_m",2), 30.0,150.0,0.5,1,0.001),
+]
+FOV_LINKS = {"FOV c0 deg": ("cameras", "cam1", "hfov_deg"),
+             "FOV c1 deg": ("cameras", "cam0", "hfov_deg")}
+
+def sl_get(cfg, spec):
+    return cfg_get(cfg, spec[1]) / spec[6]
+def sl_set(cfg, spec, v):
+    _, path, lo, hi, step, dec, unit = spec
+    v = float(np.clip(round(float(v) / step) * step, lo, hi))
+    cfg_set(cfg, path, int(round(v)) if (dec == 0 and unit == 1.0) else round(v * unit, 6))
+    if spec[0] in FOV_LINKS and cfg["view"]["fov_link"]:
+        cfg_set(cfg, FOV_LINKS[spec[0]], round(v, 3))
 
 class Panel:
-    """Self-drawn slider strip (no separate cv2 Controls window)."""
-
     def __init__(self, cfg):
         self.cfg = cfg
-        self.sel = 0
-        self.rows = []
-        self.drag = None
+        self.live = [i for i, s in enumerate(SLIDERS) if s[1] is not None]
+        self.sel = self.live[0]
+        self.rows, self.drag = [], None
 
     def draw(self, w, h):
         img = np.full((h, w, 3), 26, np.uint8)
-        rh, top = 26, 4
+        rh, top = 24, 4
         cap = max(1, (h - top) // rh)
         ncol = max(1, int(math.ceil(len(SLIDERS) / cap)))
         cw = w // ncol
         self.rows = []
-        for i, (name, path, lo, hi, step) in enumerate(SLIDERS):
+        for i, spec in enumerate(SLIDERS):
             c, r = i // cap, i % cap
             x, y = c * cw + 4, top + r * rh
             if y + rh > h:
                 continue
+            name, path, lo, hi, step, dec, unit = spec
+            if path is None:
+                cv2.putText(img, name, (x, y + 15), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.36, (120, 160, 255), 1, cv2.LINE_AA)
+                continue
             bw = cw - 12
-            val = cfg_get(self.cfg, path)
+            val = sl_get(self.cfg, spec)
             fr = (val - lo) / float(hi - lo)
             sel = (i == self.sel)
-            cv2.rectangle(img, (x, y + 14), (x + bw, y + 21), (55, 55, 55), -1)
-            cv2.rectangle(img, (x, y + 14), (x + int(bw * fr), y + 21),
-                          (0, 190, 255) if sel else (0, 120, 170), -1)
-            cv2.putText(img, f"{name}: {val}", (x, y + 11), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.36, (255, 255, 120) if sel else (200, 200, 200), 1, cv2.LINE_AA)
-            self.rows.append((i, x, y, bw, rh, lo, hi, step))
+            cv2.rectangle(img, (x, y + 13), (x + bw, y + 20), (55, 55, 55), -1)
+            if lo < 0 < hi:                                   # bipolar: draw centre tick
+                zx = x + int(bw * (-lo) / (hi - lo))
+                cv2.rectangle(img, (min(zx, x + int(bw * fr)), y + 13),
+                              (max(zx, x + int(bw * fr)), y + 20),
+                              (0, 190, 255) if sel else (0, 120, 170), -1)
+                cv2.line(img, (zx, y + 11), (zx, y + 22), (150, 150, 150), 1)
+            else:
+                cv2.rectangle(img, (x, y + 13), (x + int(bw * fr), y + 20),
+                              (0, 190, 255) if sel else (0, 120, 170), -1)
+            cv2.putText(img, f"{name}: {val:.{dec}f}", (x, y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                        (255, 255, 120) if sel else (200, 200, 200), 1, cv2.LINE_AA)
+            self.rows.append((i, x, y, bw, rh))
         return img
 
     def click(self, mx, my, down):
         if down:
-            for i, x, y, bw, rh, lo, hi, step in self.rows:
+            for i, x, y, bw, rh in self.rows:
                 if x <= mx <= x + bw and y <= my <= y + rh:
-                    self.sel, self.drag = i, (i, x, bw, lo, hi, step)
+                    self.sel, self.drag = i, (i, x, bw)
                     self._set(mx)
                     return True
         elif self.drag:
@@ -671,16 +728,20 @@ class Panel:
         return False
 
     def _set(self, mx):
-        i, x, bw, lo, hi, step = self.drag
+        i, x, bw = self.drag
+        spec = SLIDERS[i]
         fr = float(np.clip((mx - x) / max(1, bw), 0, 1))
-        v = lo + round(fr * (hi - lo) / step) * step
-        cfg_set(self.cfg, SLIDERS[i][1], int(np.clip(v, lo, hi)))
+        sl_set(self.cfg, spec, spec[2] + fr * (spec[3] - spec[2]))
+
+    def step_sel(self, d):
+        k = self.live.index(self.sel)
+        self.sel = self.live[(k + d) % len(self.live)]
+        print("[slider]", SLIDERS[self.sel][0], sl_get(self.cfg, SLIDERS[self.sel]))
 
     def nudge(self, mult):
-        name, path, lo, hi, step = SLIDERS[self.sel]
-        cfg_set(self.cfg, path, int(np.clip(cfg_get(self.cfg, path) + step * mult, lo, hi)))
-        print(f"[slider] {name} = {cfg_get(self.cfg, path)}")
-
+        spec = SLIDERS[self.sel]
+        sl_set(self.cfg, spec, sl_get(self.cfg, spec) + spec[4] * mult)
+        print(f"[slider] {spec[0]} = {sl_get(self.cfg, spec):.{spec[5]}f}")
 
 class Layout:
     """4 panes / 3 draggable boundaries, single fullscreen canvas."""
@@ -726,7 +787,23 @@ class Layout:
             self.drag = None
             self.panel.drag = None
 
-
+def apply_geom(cfg, geoms):
+    """Config -> CamGeom. Returns True if anything actually moved."""
+    changed = False
+    for i, nm in enumerate(("cam0", "cam1")):
+        c, g = cfg["cameras"][nm], geoms[i]
+        yaw = math.radians(c["yaw_deg"])
+        pitch = math.radians(c["pitch_deg"] + c["pitch_trim_deg"])
+        roll = math.radians(c["roll_deg"])
+        hf = math.radians(c["hfov_deg"])
+        C = np.array(c["pos_m"], float)
+        if (abs(g.yaw - yaw) > 1e-9 or abs(g.pitch - pitch) > 1e-9
+                or abs(g.roll - roll) > 1e-9 or abs(g.hfov - hf) > 1e-9
+                or not np.allclose(g.C, C, atol=1e-9)):
+            g.set_hfov(hf)
+            g.set_pose(yaw, pitch, roll, C)
+            changed = True
+    return changed
 def blit(dst, rect, img, pad=2):
     x0, y0, x1, y1 = rect
     x0, y0, x1, y1 = x0 + pad, y0 + pad, x1 - pad, y1 - pad
@@ -781,16 +858,18 @@ def help_text():
 
 
 # --------------------------------------------------------------------------- calib
-def refine_pose(geom, obs, free=("yaw", "pitch", "z"), iters=100):
-    names = ["yaw", "pitch", "x", "y", "z"]
-    p = np.array([geom.yaw, geom.pitch, geom.C[0], geom.C[1], geom.C[2]])
+def refine_pose(geom, obs, free, iters=120):
+    names = ["yaw", "pitch", "roll", "x", "y", "z", "f"]
+    steps = [1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-2]
+    p = np.array([geom.yaw, geom.pitch, geom.roll,
+                  geom.C[0], geom.C[1], geom.C[2], geom.f])
     sel = np.array([names.index(f) for f in free])
 
     def res(pv):
-        g = geom.clone_params(pv)
+        gg = geom.clone_params(pv)
         out = []
         for (u, v), (X, Y) in obs:
-            pr = g.project((X, Y, 0.0))
+            pr = gg.project((X, Y, 0.0))
             out += [1e3, 1e3] if pr is None else [pr[0] - u, pr[1] - v]
         return np.array(out)
 
@@ -800,8 +879,8 @@ def refine_pose(geom, obs, free=("yaw", "pitch", "z"), iters=100):
         J = np.zeros((len(r), len(sel)))
         for k, i in enumerate(sel):
             q = p.copy()
-            q[i] += 1e-4
-            J[:, k] = (res(q) - r) / 1e-4
+            q[i] += steps[i]
+            J[:, k] = (res(q) - r) / steps[i]
         try:
             dx = np.linalg.solve(J.T @ J + lam * np.eye(len(sel)), -J.T @ r)
         except np.linalg.LinAlgError:
@@ -816,9 +895,19 @@ def refine_pose(geom, obs, free=("yaw", "pitch", "z"), iters=100):
             lam *= 5
             if lam > 1e7:
                 break
-    return p, math.sqrt(cost / max(1, len(r)))
+    per = [math.hypot(r[2 * i], r[2 * i + 1]) for i in range(len(obs))]
+    return p, math.sqrt(cost / max(1, len(r))), per
 
 
+def free_params(n_obs, solve_fov):
+    fr = ["yaw", "pitch"]
+    if n_obs >= 4:
+        fr += ["roll", "z"]
+    if n_obs >= 6:
+        fr += ["x", "y"]
+    if n_obs >= 7 and solve_fov:
+        fr += ["f"]
+    return fr
 # --------------------------------------------------------------------------- topdown
 def draw_topdown(cfg, zones, engine, feet, cov, show_cov, px=900):
     w, dp = cfg["board"]["width_m"], cfg["board"]["depth_m"]
@@ -854,6 +943,11 @@ def draw_topdown(cfg, zones, engine, feet, cov, show_cov, px=900):
             col=(255, 255, 255), rel=0.022)
     names = ",".join(sorted(z["note"] for z in zones if z["midi"] in engine.active))
     txt(img, f"ACTIVE: {names}", (8, H - 12), rel=0.028, col=(0, 255, 120))
+	if len(feet) == 1 and not feet[0]["mono"]:
+        f = feet[0]
+        txt(img, f"z0 {f['z0_mm']:+6.1f}  z1 {f['z1_mm']:+6.1f}  "
+                 f"d {f['z0_mm']-f['z1_mm']:+6.1f} mm", (8, H - 34),
+            rel=0.028, col=(255, 200, 0))
     return img
 
 
@@ -932,9 +1026,16 @@ def main():
                 engine.zones = zones
                 engine.st = {z["midi"]: engine.st.get(z["midi"],
                              {"on": 0, "off": 0, "play": False}) for z in zones}
-            for d_ in det:
-                d_.rebuild_roi(cfg)
-
+			if apply_geom(cfg, g):
+                geom_dirty, t_dirty = True, time.time()
+            if geom_dirty and time.time() - t_dirty > 0.15:
+                for d_ in det:
+                    d_.rebuild_roi(cfg)
+                cov = Coverage(g[0], g[1], cfg, quiet=True)
+                geom_dirty = False
+            elif not geom_dirty:
+                for d_ in det:
+                    d_.rebuild_roi(cfg)      # cheap no-op via sig cache
             f0, t0 = cams[0].read()
             f1, t1 = cams[1].read()
             if f0 is None or f1 is None:
@@ -1058,20 +1159,28 @@ def main():
                     print(f"[calib] grabbed {lm_i}/{len(lm)}")
                     if lm_i >= len(lm):
                         for i, nm in enumerate(("cam0", "cam1")):
-                            free = ("yaw", "pitch", "z") if len(lm) < 6 else \
-                                   ("yaw", "pitch", "z", "x", "y")
-                            p, rms = refine_pose(g[i], lm_obs[i], free)
-                            g[i].set_pose(p[0], p[1], [p[2], p[3], p[4]])
-                            cfg["cameras"][nm].update(
-                                {"yaw_deg": math.degrees(p[0]), "pitch_deg": math.degrees(p[1]),
-                                 "pos_m": [float(p[2]), float(p[3]), float(p[4])]})
+                            fr = free_params(len(lm), cfg["view"]["calib_solve_fov"])
+                            p, rms, per = refine_pose(g[i], lm_obs[i], fr)
+                            g[i].set_hfov(2 * math.atan((g[i].W / 2.0) / p[6]))
+                            g[i].set_pose(p[0], p[1], p[2], p[3:6])
+                            cfg["cameras"][nm].update({
+                                "yaw_deg": math.degrees(p[0]),
+                                "pitch_deg": math.degrees(p[1]),
+                                "pitch_trim_deg": 0.0,          # folded into the base
+                                "roll_deg": math.degrees(p[2]),
+                                "pos_m": [float(p[3]), float(p[4]), float(p[5])],
+                                "hfov_deg": math.degrees(g[i].hfov)})
                             print(f"[calib] {nm}: yaw {math.degrees(p[0]):.2f} "
-                                  f"pitch {math.degrees(p[1]):.2f} pos "
-                                  f"{np.round(p[2:5],4).tolist()} rms {rms:.2f}px")
-                        for d_ in det:
-                            d_._sig = None
-                            d_.rebuild_roi(cfg)
-                        cov = Coverage(g[0], g[1], cfg)
+                                  f"pitch {math.degrees(p[1]):.2f} roll {math.degrees(p[2]):.2f} "
+                                  f"h {p[5]*1000:.1f}mm fov {math.degrees(g[i].hfov):.2f} "
+                                  f"rms {rms:.2f}px  solved={fr}")
+                            print("[calib]  per-landmark px: " +
+                                  " ".join(f"{e:.1f}" for e in per))
+                        if abs(cfg["cameras"]["cam0"]["hfov_deg"]
+                               - cfg["cameras"]["cam1"]["hfov_deg"]) > 0.5:
+                            cfg["view"]["fov_link"] = 0
+                            print("[calib] FOVs differ -> link off")
+                        geom_dirty, t_dirty = True, 0.0
                         save_cfg(cfg, args.config)
                         lm_mode = False
                     else:
