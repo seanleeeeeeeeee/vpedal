@@ -1016,6 +1016,7 @@ def main():
     fps, prev, zsig = 0.0, time.time(), None
     prev_pos = []
     scale = ds[0] / float(ps[0])
+    geom_dirty, t_dirty = True, 0.0
     try:
         while True:
             # -- zone offsets / cutoff changed? rebuild
