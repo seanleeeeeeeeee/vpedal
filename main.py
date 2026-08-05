@@ -487,7 +487,7 @@ def mono_feet(blobs, used, g, cfg, cov_mono):
 class Coverage:
     """Floor grid -> 0 dead / 1 mono / 2 stereo. Also used to gate mono fallback."""
 
-    def __init__(self, g0, g1, cfg, step=0.01):
+    def __init__(self, g0, g1, cfg, step=0.01, quiet=False):
         w, dp = cfg["board"]["width_m"], cfg["board"]["depth_m"]
         self.step, self.w, self.dp = step, w, dp
         xs = np.arange(0, w + step, step)
