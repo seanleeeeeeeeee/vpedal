@@ -206,7 +206,7 @@ class App:
                        f"pts {len(self.points[0])}/{len(self.points[1])}  "
                        f"chroma {'on' if cfg['detect']['use_chroma'] else 'off'}  "
                        f"{'MIDI' if self.engine.enabled else 'MUTE'}",
-               (10, CH - 12), rel=0.030)
+               (10, 12), rel=0.030)
         if self.lm_mode:
             lm = cfg["landmarks_m"]
             ui.txt(canvas, f"LANDMARK {self.lm_i + 1}/{len(lm)} at {lm[self.lm_i]} m -- "
@@ -258,7 +258,7 @@ class App:
             cfg["view"]["fov_link"] = 0
             print("[calib] FOVs differ -> link off")
         self.geom_dirty, self.t_dirty = True, 0.0
-        self.store.save()
+self.store.save()
         self.lm_mode = False
 
     def handle_key(self, k):
@@ -272,9 +272,9 @@ class App:
             self.lm_mode, self.lm_i, self.lm_obs = True, 0, [[], []]
             print(f"[calib] place marker at {lm[0]} m, press SPACE")
         elif k == ' ' and self.lm_mode:
-            if len(self.blobs[0]) == 1 and len(self.blobs[1]) == 1:
+            if len(self.points[0]) == 1 and len(self.points[1]) == 1:
                 for i in range(2):
-                    self.lm_obs[i].append((self.blobs[i][0]["low"], tuple(lm[self.lm_i])))
+                    self.lm_obs[i].append((self.points[i][0]["low"], tuple(lm[self.lm_i])))
                 self.lm_i += 1
                 print(f"[calib] grabbed {self.lm_i}/{len(lm)}")
                 if self.lm_i >= len(lm):
@@ -282,14 +282,21 @@ class App:
                 else:
                     print(f"[calib] next: {lm[self.lm_i]} m")
             else:
-                print(f"[calib] need exactly 1 blob per camera "
-                      f"(saw {len(self.blobs[0])}/{len(self.blobs[1])})")
+                print(f"[calib] need exactly 1 contact point per camera "
+                      f"(saw {len(self.points[0])}/{len(self.points[1])})")
         elif k == 'v':
-            self.view = (self.view + 1) % 3
+            self.view = (self.view + 1) % len(ui.VIEW_NAMES)
+            print("[view]", ui.VIEW_NAMES[self.view])
         elif k == 'o':
             self.overlay = not self.overlay
         elif k == 'c':
             self.showcov = not self.showcov
+        elif k == 't':
+            cfg["view"]["topdown_mirror"] = 0 if cfg["view"].get("topdown_mirror", 1) else 1
+            print("[view] topdown mirror =", cfg["view"]["topdown_mirror"])
+        elif k == 'u':
+            cfg["detect"]["use_chroma"] = 0 if cfg["detect"]["use_chroma"] else 1
+            print("[detect] chroma =", cfg["detect"]["use_chroma"])
         elif k == 'x':
             cfg["limits"]["x_cutoff_cm"] = int(cfg["cameras"]["cam1"]["pos_m"][0] * 100)
             print("[cutoff]", cfg["limits"]["x_cutoff_cm"], "cm")
@@ -327,9 +334,10 @@ class App:
         return True
 
     def read_key(self):
+        """stdin first (works over SSH), then the GUI window."""
         k = self.keys.get()
         if self.gui:
-            kk = cv2.waitKey(1) & 0xFF
+            kk = cv2.waitKey(1) & 0xFF        # also pumps the window / mouse events
             if k is None and kk != 255:
                 k = chr(kk)
         return k
@@ -337,15 +345,24 @@ class App:
     # -------------------------------------------------------------------- loop
     def run(self):
         print(ui.help_text())
+        draw_every = 1
         while True:
             self.sync_config()
-            f0, t0 = self.cams[0].read()
-            f1, t1 = self.cams[1].read()
-            if f0 is None or f1 is None:
-                time.sleep(0.005)
-                if self.gui:
-                    cv2.waitKey(1)
+            fr0, t0, n0 = self.cams[0].read()
+            fr1, t1, n1 = self.cams[1].read()
+
+            fresh = (fr0 is not None and fr1 is not None
+                     and (n0 != self.last_n[0] or n1 != self.last_n[1]))
+            if not fresh:
+                # nothing new from either sensor: don't burn a core re-detecting
+                k = self.read_key()
+                if k is not None and not self.handle_key(k):
+                    break
+                if not self.gui:
+                    time.sleep(0.001)
                 continue
+            self.last_n = [n0, n1]
+            self.frames = [fr0, fr1]
             self.skew_ms = abs(t0 - t1) / 1e6
 
             now = time.time()
@@ -353,9 +370,12 @@ class App:
             self.fps = 0.9 * self.fps + 0.1 / max(dt, 1e-6)
             self.t_prev = now
 
-            self.process(f0, f1, dt)
-            if self.gui:
-                self.render(f0, f1)
+            self.process(fr0, fr1, dt)
+
+            self.frame_i += 1
+            draw_every = max(1, int(self.cfg["ui"].get("draw_every", 1)))
+            if self.gui and (self.frame_i % draw_every == 0):
+                self.render()
 
             self.store.tick(now)
             k = self.read_key()
@@ -363,6 +383,10 @@ class App:
                 break
 
     def close(self):
+        try:
+            self.pool.shutdown(wait=False)
+        except Exception:
+            pass
         try:
             self.engine.panic()
         finally:
@@ -380,7 +404,8 @@ def coverage_only(cfg):
     g1 = CamGeom(cfg["cameras"]["cam1"], ps)
     cov = Coverage(g0, g1, cfg)
     zones = load_zones(cfg)
-    img = ui.draw_topdown(cfg, zones, set(), [], cov, True)
+    img = ui.TopDown().render(cfg, zones, set(), [], cov, True,
+                              int(cfg["ui"]["topdown_px"]))
     print(ui.help_text())
     if os.environ.get("DISPLAY"):
         cv2.imshow("coverage", img)
@@ -396,7 +421,7 @@ def main():
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--coverage", action="store_true")
     ap.add_argument("--fake", action="store_true",
-                    help="synthetic cameras (desktop development)")
+                    help="synthetic YUV cameras (desktop development)")
     args = ap.parse_args()
 
     store = ConfigStore(args.config)
