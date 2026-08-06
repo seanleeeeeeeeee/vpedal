@@ -1,0 +1,146 @@
+{
+  "app": {
+    "autosave": 1,
+    "autosave_delay_s": 1.5
+  },
+  "capture": {
+    "cam_index": [
+      0,
+      1
+    ],
+    "sensor_size": [
+      1640,
+      1232
+    ],
+    "process_size": [
+      820,
+      616
+    ],
+    "display_size": [
+      512,
+      384
+    ],
+    "canvas_size": [
+      1280,
+      720
+    ],
+    "fps": 40,
+    "rot180": [
+      true,
+      true
+    ],
+    "flicker_hz": 50
+  },
+  "board": {
+    "width_m": 1.2981,
+    "depth_m": 0.6501
+  },
+  "cameras": {
+    "cam0": {
+      "pos_m": [
+        0.3266556,
+        0.0,
+        0.07
+      ],
+      "yaw_deg": 45.0,
+      "pitch_deg": 26.0,
+      "pitch_trim_deg": 0.0,
+      "roll_deg": 0.0,
+      "hfov_deg": 95.8,
+      "k1": 0.0,
+      "k2": 0.0,
+      "ppx": 0.0,
+      "ppy": 0.0
+    },
+    "cam1": {
+      "pos_m": [
+        1.33254,
+        0.0,
+        0.07
+      ],
+      "yaw_deg": 135.0,
+      "pitch_deg": 26.0,
+      "pitch_trim_deg": 0.0,
+      "roll_deg": -1.4,
+      "hfov_deg": 95.8,
+      "k1": 0.0,
+      "k2": 0.0,
+      "ppx": 0.0,
+      "ppy": 0.0
+    }
+  },
+  "view": {
+    "fov_link": 1,
+    "calib_solve_fov": 1
+  },
+  "detect": {
+    "diff_thresh": 14,
+    "rel_thresh_pct": 15,
+    "blur_k": 4,
+    "open_k": 3,
+    "close_k": 14,
+    "min_area": 120,
+    "max_area": 30000,
+    "band_px": 3,
+    "z_contact_mm": 20,
+    "z_pair_tol_mm": 60,
+    "on_frames": 2,
+    "off_frames": 4,
+    "mono_on_frames": 4,
+    "snap_mm": 15,
+    "roi_margin_cm": 6,
+    "roi_zmax_cm": 30,
+    "max_blobs": 3,
+    "mono_enable": 1,
+    "w_track": 0.15
+  },
+  "limits": {
+    "x_cutoff_cm": 29,
+    "cutoff_low_side": 1
+  },
+  "zones": {
+    "black": "boxes_black.json",
+    "white": "boxes_white.json",
+    "zone_dx_mm": -41,
+    "zone_dy_mm": 38,
+    "mirror_x": 1,
+    "mirror_y": 0
+  },
+  "midi": {
+    "channel": 0,
+    "vel_min": 45,
+    "vel_max": 120,
+    "vel_gain": 250.0
+  },
+  "layout": {
+    "hsplit": 0.6319444444444444,
+    "vsplit": 0.5,
+    "bsplit": 0.6234375
+  },
+  "landmarks_m": [
+    [
+      0.04,
+      0.05
+    ],
+    [
+      1.26,
+      0.05
+    ],
+    [
+      1.26,
+      0.61
+    ],
+    [
+      0.04,
+      0.61
+    ],
+    [
+      0.65,
+      0.33
+    ],
+    [
+      0.65,
+      0.6
+    ]
+  ]
+}
