@@ -141,6 +141,10 @@ class App:
     def cam_pane(self, i):
         cfg = self.cfg
         det, geom = self.det[i], self.g[i]
+        # Only cost the extra classify buffer while you're actually looking at it.
+        # (Takes effect on the *next* detect() call -> one frame of lag when you
+        # switch into/out of view 4, which is harmless.)
+        det.want_cls = (self.view == 4)
         y = self.frames[i][0]
         if self.view == 1 and det.bg_y is not None and det.bg_y.shape == y.shape:
             src = cv2.subtract(y, det.bg_y)
@@ -151,14 +155,40 @@ class App:
         if det.mask is not None:
             mm = cv2.resize(det.mask, self.ds, interpolation=cv2.INTER_NEAREST)
             vis[mm == 0] = vis[mm == 0] // 3
-        if self.view == 3:                                   # chroma distance map
+        x0, y0, x1, y1 = det.bbox
+        roi_shape = (y1 - y0, x1 - x0)
+        # ---------------------------------------------------------- view 4: classify
+        if self.view == 4:
+            cls = det.dbg_cls
+            if cls is None or cls.shape != roi_shape:
+                vis = vis // 3
+                ui.txt(vis, "classify: building (wait one frame)...", (6, 40),
+                       rel=0.034, col=(0, 120, 255))
+            else:
+                full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
+                full[y0:y1, x0:x1] = cls
+                idx = cv2.resize(full, self.ds, interpolation=cv2.INTER_NEAREST)
+                vis = CLS_COLOR[idx]                        # LUT: class id -> BGR
+                if det.mask is not None:
+                    mm = cv2.resize(det.mask, self.ds, interpolation=cv2.INTER_NEAREST)
+                    vis[mm == 0] = vis[mm == 0] // 3
+                legend = [("bright", (0, 220, 0)), ("chroma", (0, 230, 200)),
+                          ("opaque", (220, 0, 220)), ("grown->contact", (0, 0, 255)),
+                          ("shadow (rejected)", (200, 60, 0))]
+                for n, (lbl, c) in enumerate(legend):
+                    ui.txt(vis, lbl, (6, 34 + 14 * n), rel=0.026, col=c)
+            ui.txt(vis, f"cam{i} {ui.VIEW_NAMES[self.view]}", (6, 16), rel=0.030)
+            self._draw_probe(vis, i)
+            return vis
+        # ---------------------------------------------------------- view 3: chroma
+        if self.view == 3:
             cd = det.dbg_cd
-            x0, y0, x1, y1 = det.bbox
-            if cd is None or cd.shape != (y1 - y0, x1 - x0):
+            if cd is None or cd.shape != roi_shape:
                 vis = vis // 3
                 ui.txt(vis, "NO CHROMA: " + det.chroma_state, (6, 40),
                        rel=0.034, col=(0, 120, 255))
                 ui.txt(vis, f"cam{i} {ui.VIEW_NAMES[self.view]}", (6, 16), rel=0.030)
+                self._draw_probe(vis, i)
                 return vis
             full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
             full[y0:y1, x0:x1] = cd
@@ -166,25 +196,32 @@ class App:
             amp = cv2.resize(cv2.convertScaleAbs(full, alpha=gain), self.ds,
                              interpolation=cv2.INTER_NEAREST)
             vis = cv2.applyColorMap(amp, cv2.COLORMAP_INFERNO)
-            over = cv2.resize(cv2.threshold(full, float(cfg["detect"]["chroma_thresh"]),
-                                            255, cv2.THRESH_BINARY)[1],
-                              self.ds, interpolation=cv2.INTER_NEAREST)
+            # detect.py now uses a per-pixel noise-adaptive tolerance (det._tol);
+            # fall back to the scalar slider only if that map isn't available.
+            if det._tol is not None and det._tol.shape == roi_shape:
+                tolfull = np.zeros((self.ps[1], self.ps[0]), np.float32)
+                tolfull[y0:y1, x0:x1] = det._tol
+                passmask = (full.astype(np.float32) > tolfull).astype(np.uint8) * 255
+            else:
+                passmask = cv2.threshold(full, float(cfg["detect"]["chroma_thresh"]),
+                                         255, cv2.THRESH_BINARY)[1]
+            over = cv2.resize(passmask, self.ds, interpolation=cv2.INTER_NEAREST)
             vis[over > 0] = (0, 255, 0)                      # what counts as "object"
             if det.mask is not None:
                 mm = cv2.resize(det.mask, self.ds, interpolation=cv2.INTER_NEAREST)
                 vis[mm == 0] = vis[mm == 0] // 3
-            ui.txt(vis, f"cam{i} chroma  gain x{gain:.0f}  thr "
+            ui.txt(vis, f"cam{i} chroma(norm)  gain x{gain:.0f}  thr "
                         f"{cfg['detect']['chroma_thresh']}", (6, 16), rel=0.030)
+            self._draw_probe(vis, i)
             return vis
-        if self.view == 2:                                   # binary foreground
+        # ---------------------------------------------------------- view 2: fg mask
+        if self.view == 2:
             layer = self.masks[i]
-            if layer is not None:
+            if layer is not None and layer.shape == roi_shape:
                 full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
-                x0, y0, x1, y1 = det.bbox
-                if layer.shape == (y1 - y0, x1 - x0):
-                    full[y0:y1, x0:x1] = layer
-                    lr = cv2.resize(full, self.ds, interpolation=cv2.INTER_NEAREST)
-                    vis[lr > 0] = (0, 200, 0)
+                full[y0:y1, x0:x1] = layer
+                lr = cv2.resize(full, self.ds, interpolation=cv2.INTER_NEAREST)
+                vis[lr > 0] = (0, 200, 0)
         if self.overlay:
             self.ov[i].update(cfg, self.zones, geom, self.scale)
             self.ov[i].draw(vis, self.engine.active)
@@ -205,8 +242,21 @@ class App:
         for p in self.points[i]:
             cv2.circle(vis, (int(p["low"][0] * s), int(p["low"][1] * s)), 4, (0, 0, 255), -1)
         ui.txt(vis, f"cam{i} {ui.VIEW_NAMES[self.view]}", (6, 16), rel=0.030)
+        self._draw_probe(vis, i)
         return vis
-
+    def _draw_probe(self, vis, i):
+        """Crosshair + live readout for whatever pixel was last clicked in this
+        pane (any view). Wired up by a small addition to the mouse callback --
+        see notes below."""
+        p = getattr(self, "probe_px", (None, None))[i]
+        if not p:
+            return
+        s = self.scale
+        u, v = p
+        cx, cy = int(round(u * s)), int(round(v * s))
+        cv2.drawMarker(vis, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 16, 2)
+        line = self.det[i].probe(u, v, self.cfg)
+        ui.txt(vis, line, (6, vis.shape[0] - 8), rel=0.024, col=(0, 255, 255))
     def render(self):
         cfg = self.cfg
         CW, CH = cfg["capture"]["canvas_size"]
@@ -226,6 +276,7 @@ class App:
         ui.txt(canvas, f"FPS {self.fps:4.1f}  vis {self.t_vis:4.1f}ms  "
                        f"skew {self.skew_ms:4.1f}ms  "
                        f"pts {len(self.points[0])}/{len(self.points[1])}  "
+                       f"view [{self.view}] {ui.VIEW_NAMES[self.view]}  "
                        f"chroma {'on' if cfg['detect']['use_chroma'] else 'off'}  "
                        f"{'MIDI' if self.engine.enabled else 'MUTE'}",
                (10, 12), rel=0.030)
@@ -236,6 +287,9 @@ class App:
         if self.det[0].bg_y is None or self.det[1].bg_y is None:
             ui.txt(canvas, "PRESS 'b' WITH THE AREA EMPTY", (10, 60),
                    rel=0.045, col=(0, 0, 255))
+        elif self.view in (3, 4):
+            ui.txt(canvas, "click a cam pane to probe a pixel  |  'A' = auto-threshold suggestion",
+                   (10, 60), rel=0.026, col=(120, 200, 255))
         cv2.imshow(self.win, canvas)
 
     # ------------------------------------------------------------------ keys
@@ -280,7 +334,7 @@ class App:
             cfg["view"]["fov_link"] = 0
             print("[calib] FOVs differ -> link off")
         self.geom_dirty, self.t_dirty = True, 0.0
-self.store.save()
+        self.store.save()
         self.lm_mode = False
 
     def handle_key(self, k):
@@ -331,6 +385,13 @@ self.store.save()
             cfg["zones"]["mirror_x"] = 0 if cfg["zones"]["mirror_x"] else 1
             self.engine.panic()
             print("[zones] mirror_x =", cfg["zones"]["mirror_x"])
+        elif k == 'p':                       # probe the last clicked pixel
+            for i, d_ in enumerate(self.det):
+                if self.probe_px[i]:
+                    print(f"[probe cam{i}] {d_.probe(*self.probe_px[i], cfg)}")
+        elif k == 'A':
+            for d_ in self.det:
+                d_.suggest(cfg)
         elif k == 'm':
             self.engine.panic()
             self.engine.enabled = not self.engine.enabled
@@ -370,6 +431,8 @@ self.store.save()
         draw_every = 1
         while True:
             self.sync_config()
+            for d_ in self.det:
+                d_.want_cls = (self.view == 4)
             fr0, t0, n0 = self.cams[0].read()
             fr1, t1, n1 = self.cams[1].read()
 

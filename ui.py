@@ -17,7 +17,7 @@ try:
 except ImportError:
     HAVE_TTY = False
 
-VIEW_NAMES = ("gray", "diff", "mask", "chroma")
+VIEW_NAMES = ("gray", "diff", "fg", "chroma", "classify")
 
 
 def pose_sig(g):
@@ -50,12 +50,19 @@ SLIDERS = [
     ("Rel thresh %",   ("detect", "rel_thresh_pct"),   0, 40, 1, 0, 1.0),
     ("Blur k",         ("detect", "blur_k"),           1, 15, 2, 0, 1.0),
     _H("- CHROMA / SHADOW -"),
-    ("Use chroma",     ("detect", "use_chroma"),       0, 1, 1, 0, 1.0),
+    ("Noise k",        ("detect", "noise_k"),          1, 12, 1, 0, 1.0),
+    ("Dark min",       ("detect", "dark_min"),         2, 40, 1, 0, 1.0),
+    ("Use chroma",     ("detect", "use_chroma"),       0, 1,  1, 0, 1.0),
     ("Chroma thr",     ("detect", "chroma_thresh"),    2, 60, 1, 0, 1.0),
-    ("Shadow UV tol",  ("detect", "shadow_chroma_tol"), 1, 40, 1, 0, 1.0),
-    ("Shadow Ymin %",  ("detect", "shadow_ymin_pct"),  5, 90, 1, 0, 1.0),
+    ("Chroma Yfloor",  ("detect", "chroma_y_floor"),  10, 120, 1, 0, 1.0),
+    ("Chroma minY",    ("detect", "chroma_min_y"),     4, 90, 1, 0, 1.0),
+    ("Shadow lo %",    ("detect", "shadow_lo_pct"),    5, 95, 1, 0, 1.0),
     ("Dark obj thr",   ("detect", "dark_obj_thresh"),  5, 120, 1, 0, 1.0),
-    _H("- BLOBS / SPLIT -"),
+    ("Contact grow px",("detect", "contact_grow_px"),  0, 8,  1, 0, 1.0),
+    ("Split prom cm",  ("detect", "split_min_prom_cm"),1, 20, 1, 0, 1.0),
+    ("Split sep cm",   ("detect", "split_min_sep_cm"), 3, 30, 1, 0, 1.0),
+    ("Reject edge px", ("detect", "reject_edge_px"),   0, 20, 1, 0, 1.0),
+    ("Z bias mm",      ("detect", "z_bias_mm"),        0, 30, 1, 0, 1.0),    _H("- BLOBS / SPLIT -"),
     ("Open k",         ("detect", "open_k"),           1, 15, 2, 0, 1.0),
     ("Close k",        ("detect", "close_k"),          1, 25, 2, 0, 1.0),
     ("Min area px",    ("detect", "min_area"),        20, 4000, 10, 0, 1.0),

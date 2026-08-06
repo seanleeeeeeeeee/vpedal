@@ -34,19 +34,26 @@ DEFAULT_CFG = {
     "view": {"fov_link": 1, "calib_solve_fov": 1, "topdown_mirror": 1},
     "ui": {"draw_every": 1, "topdown_px": 720, "cv_threads": 2},
     "detect": {
-        # luma
-        "diff_thresh": 40, "rel_thresh_pct": 8, "blur_k": 5,
-        # chroma / shadow model
-        "use_chroma": 1, "chroma_thresh": 14, "shadow_chroma_tol": 7,
-        "shadow_ymin_pct": 30, "dark_obj_thresh": 25,
-        # morphology / blobs
+        # ---- luma (all thresholds are floored by noise_k * measured pixel noise)
+        "blur_k": 5, "diff_thresh": 16, "rel_thresh_pct": 6, "noise_k": 4,
+        "dark_min": 6,
+        # ---- illumination-invariant chroma
+        "use_chroma": 1, "chroma_thresh": 10,     # normalised units, ONE boundary
+        "chroma_y_floor": 40,                     # cap normalisation gain in shadow
+        "chroma_min_y": 24,                       # below this Y, chroma is noise
+        # ---- shadow vs. opaque object
+        "shadow_lo_pct": 28,                      # Y/Ybg below this = too dark for a shadow
+        "dark_obj_thresh": 25,
+        # ---- heel/contact recovery
+        "contact_grow_px": 3,
+        # ---- morphology / blobs
         "open_k": 3, "close_k": 5, "min_area": 120, "max_area": 60000,
-        "max_blobs": 3, "max_points": 4,
-        # bottom-profile contact splitting
-        "band_px": 3, "prof_smooth_px": 7, "split_min_prom_px": 6,
-        "split_min_sep_px": 22, "max_contacts": 2,
-        # geometry gates / timing
-        "z_contact_mm": 20, "z_pair_tol_mm": 60,
+        "max_blobs": 3, "max_points": 4, "reject_edge_px": 0,
+        # ---- contact splitting (world units now, not pixels)
+        "band_px": 3, "prof_smooth_px": 7, "split_win_px": 21,
+        "split_min_prom_cm": 4, "split_min_sep_cm": 8, "max_contacts": 2,
+        # ---- geometry gates / timing
+        "z_contact_mm": 20, "z_bias_mm": 4, "z_pair_tol_mm": 60,
         "on_frames": 2, "off_frames": 4, "mono_on_frames": 4, "snap_mm": 15,
         "roi_margin_cm": 6, "roi_zmax_cm": 30,
         "mono_enable": 1, "w_track": 0.15
