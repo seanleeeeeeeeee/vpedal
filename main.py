@@ -1,36 +1,32 @@
 """
 pedalvision -- camera-vision virtual organ pedalboard (Raspberry Pi 5, 2x IMX219-77).
 
-Entry point / main loop.  Modules:
-  config.py    defaults + persistent, autosaving config
+  config.py    persistent, autosaving config
   boardmap.py  note names, key zones (mirroring), play-area limits
   geometry.py  camera model + triangulation
-  camera.py    picamera2 grabbers (and a fake camera for desktop dev)
-  detect.py    background subtraction, stereo/mono feet, coverage map
+  camera.py    picamera2 YUV grabbers (+ fake camera)
+  detect.py    YUV background subtraction, contact splitting, coverage
   engine.py    foot tracking, hit-test, note debouncing, MIDI
   calib.py     landmark pose solver
-  ui.py        sliders, layout, top-down view, key reader
-
-Keys work over SSH (raw stdin) *and* in the GUI window -- see ui.help_text().
+  ui.py        sliders, layout, cached overlays, top-down view
 """
 import argparse
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 
 import ui
-from boardmap import cutoff_m, load_zones, zone_enabled, zone_signature
+from boardmap import load_zones, zone_signature
 from calib import free_params, refine_pose
 from camera import open_cameras
-from config import BG_PATH, CFG_PATH, ConfigStore
+from config import BG_PATH, BG_PATH_OLD, CFG_PATH, ConfigStore
 from detect import Coverage, Detector, mono_feet, stereo_feet
 from engine import FootTracker, NoteEngine
 from geometry import CamGeom, apply_geom
-
-VIEW_NAMES = ("gray", "diff", "mask")
 
 
 class App:
@@ -38,6 +34,12 @@ class App:
         self.store = store
         self.cfg = cfg = store.cfg
         self.gui = gui
+        cv2.setUseOptimized(True)
+        try:
+            cv2.setNumThreads(int(cfg["ui"].get("cv_threads", 2)))
+        except Exception:
+            pass
+
         self.ps = tuple(cfg["capture"]["process_size"])
         self.ds = tuple(cfg["capture"]["display_size"])
         self.scale = self.ds[0] / float(self.ps[0])
@@ -53,9 +55,10 @@ class App:
 
         self.det = [Detector(self.g[0]), Detector(self.g[1])]
         for i in range(2):
-            p = BG_PATH.format(i)
-            if os.path.exists(p) and self.det[i].load_background(p):
-                print(f"[bg] loaded cam{i}")
+            for p in (BG_PATH.format(i), BG_PATH_OLD.format(i)):
+                if os.path.exists(p) and self.det[i].load_background(p):
+                    print(f"[bg] loaded {p}")
+                    break
             self.det[i].rebuild_roi(cfg)
 
         self.zones = load_zones(cfg)
@@ -66,12 +69,14 @@ class App:
         self.panel = ui.Panel(cfg)
         self.layout = ui.Layout(cfg, self.panel)
         self.keys = ui.KeyReader()
+        self.ov = [ui.ZoneOverlay(), ui.ZoneOverlay()]
+        self.td = ui.TopDown()
+        self.pool = ThreadPoolExecutor(max_workers=2)
 
         self.win = "PedalVision"
         if gui:
             cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
-            cv2.setWindowProperty(self.win, cv2.WND_PROP_FULLSCREEN,
-                                  cv2.WINDOW_FULLSCREEN)
+            cv2.setWindowProperty(self.win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
             cv2.setMouseCallback(self.win, self.layout.on_mouse)
 
         self.view, self.overlay, self.showcov = 0, True, False
@@ -79,12 +84,17 @@ class App:
         self.fps, self.t_prev = 0.0, time.time()
         self.prev_pos = []
         self.geom_dirty, self.t_dirty = True, 0.0
-        self.blobs = [[], []]
-        self.ths = [None, None]
+        self.points = [[], []]
+        self.comps = [[], []]
+        self.masks = [None, None]
         self.feet = []
+        self.frames = [None, None]
+        self.last_n = [-1, -1]
         self.skew_ms = 0.0
+        self.frame_i = 0
+        self.t_vis = 0.0
 
-    # ------------------------------------------------------------- housekeeping
+    # --------------------------------------------------------- housekeeping
     def sync_config(self):
         cfg = self.cfg
         sig = zone_signature(cfg)
@@ -101,114 +111,130 @@ class App:
             self.geom_dirty = False
         elif not self.geom_dirty:
             for d in self.det:
-                d.rebuild_roi(cfg)          # cheap no-op via signature cache
+                d.rebuild_roi(cfg)          # no-op via signature cache
 
-    # ------------------------------------------------------------------ vision
-    def process(self, f0, f1, dt):
+    # ---------------------------------------------------------------- vision
+    def process(self, fr0, fr1, dt):
         cfg = self.cfg
-        self.blobs = [[], []]
-        self.ths = [None, None]
-        self.feet = []
-        if self.det[0].bg is None or self.det[1].bg is None:
+        if self.det[0].bg_y is None or self.det[1].bg_y is None:
+            self.points = [[], []]
+            self.comps = [[], []]
+            self.masks = [None, None]
+            self.feet = []
             return
-        self.blobs[0], self.ths[0] = self.det[0].detect(f0, cfg)
-        self.blobs[1], self.ths[1] = self.det[1].detect(f1, cfg)
-        feet, u0, u1 = stereo_feet(self.blobs[0], self.blobs[1],
-                                   self.g[0], self.g[1], cfg, self.prev_pos)
-        feet += mono_feet(self.blobs[0], u0, self.g[0], cfg, self.cov.is_mono)
-        feet += mono_feet(self.blobs[1], u1, self.g[1], cfg, self.cov.is_mono)
+        t0 = time.perf_counter()
+        a = self.pool.submit(self.det[0].detect, fr0, cfg)
+        b = self.pool.submit(self.det[1].detect, fr1, cfg)
+        p0, c0, m0 = a.result()
+        p1, c1, m1 = b.result()
+        self.points, self.comps, self.masks = [p0, p1], [c0, c1], [m0, m1]
+        feet, u0, u1 = stereo_feet(p0, p1, self.g[0], self.g[1], cfg, self.prev_pos)
+        feet += mono_feet(p0, u0, self.g[0], cfg, self.cov.is_mono)
+        feet += mono_feet(p1, u1, self.g[1], cfg, self.cov.is_mono)
         self.feet = feet[:2]                                # 2-note polyphony
         self.prev_pos = self.tracker.update(self.feet, dt)
         if not self.lm_mode:
             self.engine.update(self.feet)
+        self.t_vis = 0.9 * self.t_vis + 0.1 * (time.perf_counter() - t0) * 1000.0
 
-    # ------------------------------------------------------------------ render
-    def cam_pane(self, i, frame):
+    # ---------------------------------------------------------------- render
+    def cam_pane(self, i):
         cfg = self.cfg
         det, geom = self.det[i], self.g[i]
-        small = cv2.resize(frame, self.ds, interpolation=cv2.INTER_AREA)
-        if self.view == 1 and det.bg is not None and det.bg.shape == frame.shape:
-            small = cv2.resize(cv2.subtract(frame, det.bg), self.ds)
+        y = self.frames[i][0]
+        if self.view == 1 and det.bg_y is not None and det.bg_y.shape == y.shape:
+            src = cv2.subtract(y, det.bg_y)
+        else:
+            src = y
+        small = cv2.resize(src, self.ds, interpolation=cv2.INTER_NEAREST)
         vis = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
         if det.mask is not None:
             mm = cv2.resize(det.mask, self.ds, interpolation=cv2.INTER_NEAREST)
             vis[mm == 0] = vis[mm == 0] // 3
-        if self.ths[i] is not None and self.view == 2:
-            full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
-            x0, y0, x1, y1 = det.bbox
-            full[y0:y1, x0:x1] = self.ths[i]
-            vis[cv2.resize(full, self.ds, interpolation=cv2.INTER_NEAREST) > 0] = (0, 90, 0)
+        if self.view in (2, 3):
+            layer = self.masks[i] if self.view == 2 else det.dbg_cd
+            if layer is not None:
+                full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
+                x0, y0, x1, y1 = det.bbox
+                if layer.shape == (y1 - y0, x1 - x0):
+                    full[y0:y1, x0:x1] = layer
+                    lr = cv2.resize(full, self.ds, interpolation=cv2.INTER_NEAREST)
+                    if self.view == 2:
+                        vis[lr > 0] = (0, 90, 0)
+                    else:
+                        vis[..., 2] = np.maximum(vis[..., 2], lr)
         if self.overlay:
-            for z in self.zones:
-                if not zone_enabled(z, cfg):
-                    continue
-                pp = [geom.project((float(p[0]), float(p[1]), 0.0))
-                      for p in z["poly"].reshape(-1, 2)]
-                if any(p is None for p in pp):
-                    continue
-                pts = (np.array(pp) * self.scale).astype(np.int32)
-                c = (0, 200, 0) if z["midi"] in self.engine.active else \
-                    ((90, 90, 160) if z["black"] else (70, 70, 70))
-                cv2.polylines(vis, [pts], True, c, 1)
-        for b in self.blobs[i]:
-            cv2.drawContours(vis, [(b["c"] * self.scale).astype(np.int32)], -1,
-                             (0, 255, 0), 1,
-                             offset=(int(b["off"][0] * self.scale),
-                                     int(b["off"][1] * self.scale)))
-            cv2.circle(vis, (int(b["low"][0] * self.scale),
-                             int(b["low"][1] * self.scale)), 4, (0, 0, 255), -1)
-        ui.txt(vis, f"cam{i} {VIEW_NAMES[self.view]}", (6, 16), rel=0.030)
+            self.ov[i].update(cfg, self.zones, geom, self.scale)
+            self.ov[i].draw(vis, self.engine.active)
+        s = self.scale
+        for c in self.comps[i]:
+            ox, oy = c["org"]
+            w, h = c["wh"]
+            cv2.rectangle(vis, (int(ox * s), int(oy * s)),
+                          (int((ox + w) * s), int((oy + h) * s)),
+                          (0, 255, 0) if c["n"] < 2 else (0, 220, 255), 1)
+            prof = c["prof"]
+            cols = np.nonzero(prof >= 0)[0]
+            if len(cols) > 3:
+                step = max(1, len(cols) // 64)
+                pts = np.stack([(ox + cols[::step]) * s,
+                                (oy + prof[cols[::step]]) * s], axis=1).astype(np.int32)
+                cv2.polylines(vis, [pts], False, (255, 160, 0), 1)
+        for p in self.points[i]:
+            cv2.circle(vis, (int(p["low"][0] * s), int(p["low"][1] * s)), 4, (0, 0, 255), -1)
+        ui.txt(vis, f"cam{i} {ui.VIEW_NAMES[self.view]}", (6, 16), rel=0.030)
         return vis
 
-    def render(self, f0, f1):
+    def render(self):
         cfg = self.cfg
         CW, CH = cfg["capture"]["canvas_size"]
         canvas = np.full((CH, CW, 3), 12, np.uint8)
         rects = self.layout.compute(CW, CH)
-        ui.blit(canvas, rects["cam0"], self.cam_pane(0, f0))
-        ui.blit(canvas, rects["cam1"], self.cam_pane(1, f1))
+        ui.blit(canvas, rects["cam0"], self.cam_pane(0))
+        ui.blit(canvas, rects["cam1"], self.cam_pane(1))
         ui.blit(canvas, rects["top"],
-                ui.draw_topdown(cfg, self.zones, self.engine.active,
-                                self.feet, self.cov, self.showcov))
+                self.td.render(cfg, self.zones, self.engine.active, self.feet,
+                               self.cov, self.showcov, int(cfg["ui"]["topdown_px"])))
         pr = rects["panel"]
         ui.blit(canvas, pr, self.panel.draw(pr[2] - pr[0] - 4, pr[3] - pr[1] - 4), pad=2)
         L = self.layout.lines
         cv2.line(canvas, (0, L["h"]), (CW, L["h"]), (70, 70, 70), 2)
         cv2.line(canvas, (L["v"], 0), (L["v"], L["h"]), (70, 70, 70), 2)
         cv2.line(canvas, (L["b"], L["h"]), (L["b"], CH), (70, 70, 70), 2)
-        ui.txt(canvas, f"FPS {self.fps:4.1f}  skew {self.skew_ms:4.1f}ms  "
-                       f"blobs {len(self.blobs[0])}/{len(self.blobs[1])}  "
-                       f"cut {cfg['limits']['x_cutoff_cm']}cm"
-                       f"{'(low)' if cfg['limits']['cutoff_low_side'] else '(high)'}  "
-                       f"mirX {int(bool(cfg['zones']['mirror_x']))}  "
+        ui.txt(canvas, f"FPS {self.fps:4.1f}  vis {self.t_vis:4.1f}ms  "
+                       f"skew {self.skew_ms:4.1f}ms  "
+                       f"pts {len(self.points[0])}/{len(self.points[1])}  "
+                       f"chroma {'on' if cfg['detect']['use_chroma'] else 'off'}  "
                        f"{'MIDI' if self.engine.enabled else 'MUTE'}",
                (10, CH - 12), rel=0.030)
         if self.lm_mode:
             lm = cfg["landmarks_m"]
             ui.txt(canvas, f"LANDMARK {self.lm_i + 1}/{len(lm)} at {lm[self.lm_i]} m -- "
                            "place marker, SPACE", (10, 24), rel=0.040, col=(0, 150, 255))
-        if self.det[0].bg is None or self.det[1].bg is None:
+        if self.det[0].bg_y is None or self.det[1].bg_y is None:
             ui.txt(canvas, "PRESS 'b' WITH THE AREA EMPTY", (10, 60),
                    rel=0.045, col=(0, 0, 255))
         cv2.imshow(self.win, canvas)
 
-    # -------------------------------------------------------------------- keys
+    # ------------------------------------------------------------------ keys
     def grab_background(self):
-        cfg = self.cfg
         print("[bg] capturing, keep area empty...")
-        st = [[], []]
-        for _ in range(25):
+        st, last = [[], []], [-1, -1]
+        t_end = time.time() + 2.0
+        while time.time() < t_end and min(len(st[0]), len(st[1])) < 20:
             for i in range(2):
-                fr, _ = self.cams[i].read()
-                if fr is not None:
-                    st[i].append(fr.copy())
-            time.sleep(1.0 / max(1, cfg["capture"]["fps"]))
+                fr, ts, n = self.cams[i].read()
+                if fr is not None and n != last[i]:
+                    last[i] = n
+                    st[i].append(fr)
+            time.sleep(0.004)
+        ok = True
         for i in range(2):
-            bg = self.det[i].set_background(st[i], cfg["detect"]["blur_k"])
-            if bg is not None:
-                np.save(BG_PATH.format(i), bg)
-        print("[bg] done" if all(d.bg is not None for d in self.det)
-              else "[bg] FAILED -- cameras delivering frames?")
+            if self.det[i].set_background(st[i], self.cfg):
+                self.det[i].save_background(BG_PATH.format(i))
+            else:
+                ok = False
+        print("[bg] done" if ok else "[bg] FAILED -- cameras delivering frames?")
 
     def solve_landmarks(self):
         cfg = self.cfg
@@ -219,10 +245,8 @@ class App:
             self.g[i].set_hfov(2 * math.atan((self.g[i].W / 2.0) / p[6]))
             self.g[i].set_pose(p[0], p[1], p[2], p[3:6])
             cfg["cameras"][nm].update({
-                "yaw_deg": math.degrees(p[0]),
-                "pitch_deg": math.degrees(p[1]),
-                "pitch_trim_deg": 0.0,                 # folded into the base
-                "roll_deg": math.degrees(p[2]),
+                "yaw_deg": math.degrees(p[0]), "pitch_deg": math.degrees(p[1]),
+                "pitch_trim_deg": 0.0, "roll_deg": math.degrees(p[2]),
                 "pos_m": [float(p[3]), float(p[4]), float(p[5])],
                 "hfov_deg": math.degrees(self.g[i].hfov)})
             print(f"[calib] {nm}: yaw {math.degrees(p[0]):.2f} "
@@ -230,8 +254,7 @@ class App:
                   f"h {p[5] * 1000:.1f}mm fov {math.degrees(self.g[i].hfov):.2f} "
                   f"rms {rms:.2f}px  solved={fr}")
             print("[calib]  per-landmark px: " + " ".join(f"{e:.1f}" for e in per))
-        if abs(cfg["cameras"]["cam0"]["hfov_deg"]
-               - cfg["cameras"]["cam1"]["hfov_deg"]) > 0.5:
+        if abs(cfg["cameras"]["cam0"]["hfov_deg"] - cfg["cameras"]["cam1"]["hfov_deg"]) > 0.5:
             cfg["view"]["fov_link"] = 0
             print("[calib] FOVs differ -> link off")
         self.geom_dirty, self.t_dirty = True, 0.0

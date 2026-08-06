@@ -1,6 +1,10 @@
 """
-detect.py -- background subtraction inside a world-derived ROI, stereo pairing,
-mono fallback and the floor coverage map.
+detect.py -- YUV background subtraction with chroma shadow rejection,
+bottom-profile contact splitting, stereo pairing and the coverage map.
+
+detect() returns (points, comps, fg_mask):
+  points -- floor contact candidates, one per foot even if the blobs merged
+  comps  -- connected components (drawing / diagnostics only)
 """
 import itertools
 import math
@@ -17,55 +21,156 @@ def _odd(v, lo=1):
     return v | 1
 
 
-def _contours(img):
-    res = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return res[0] if len(res) == 2 else res[1]      # OpenCV 3/4 safe
+# ------------------------------------------------------------ contact points
+def _refine(prof, i, band):
+    lo, hi = max(0, i - band), min(prof.shape[0], i + band + 1)
+    win = prof[lo:hi]
+    ok = win >= 0
+    if not ok.any():
+        return float(i), float(max(prof[i], 0))
+    vmax = int(win[ok].max())
+    cols = np.nonzero(ok & (win >= vmax - 1))[0] + lo
+    return float(np.median(cols)), float(vmax)
 
 
+def _contacts(prof, d):
+    """
+    prof[col] = lowest image row of the blob in that column (-1 = empty).
+    Returns up to `max_contacts` (col, row) points: the *prominent* local
+    minima in world height, so two merged feet still give two contacts.
+    """
+    n = int(prof.shape[0])
+    valid = prof >= 0
+    nv = int(valid.sum())
+    if nv < 3:
+        return []
+    band = max(1, int(d.get("band_px", 3)))
+    p = prof.astype(np.float32)
+    if nv < n:                                   # bridge gaps so peaks stay real
+        xs = np.nonzero(valid)[0]
+        ms = np.nonzero(~valid)[0]
+        p[ms] = np.interp(ms, xs, p[xs])
+    k = _odd(d.get("prof_smooth_px", 7))
+    ps = cv2.blur(p.reshape(1, -1), (k, 1)).ravel() if (k > 1 and n > k) else p
+
+    maxc = max(1, int(d.get("max_contacts", 2)))
+    sep = max(2, int(d.get("split_min_sep_px", 22)))
+    prom = float(d.get("split_min_prom_px", 6))
+    if maxc == 1 or n <= sep + 2:
+        return [_refine(prof, int(np.argmax(ps)), band)]
+
+    dil = cv2.dilate(ps.reshape(1, -1), np.ones((1, 2 * sep + 1), np.uint8)).ravel()
+    isp = ps >= dil - 1e-3
+    runs, i = [], 0
+    while i < n:
+        if isp[i]:
+            j = i
+            while j + 1 < n and isp[j + 1]:
+                j += 1
+            runs.append(i + int(np.argmax(ps[i:j + 1])))
+            i = j + 1
+        else:
+            i += 1
+    if not runs:
+        runs = [int(np.argmax(ps))]
+    runs.sort(key=lambda t: -ps[t])
+
+    chosen = [runs[0]]
+    for r in runs[1:]:
+        if len(chosen) >= maxc:
+            break
+        ok = True
+        for c in chosen:
+            a, b = (r, c) if r < c else (c, r)
+            if b - a < sep:
+                ok = False
+                break
+            valley = float(ps[a:b + 1].min())
+            if min(float(ps[a]), float(ps[b])) - valley < prom:
+                ok = False
+                break
+        if ok:
+            chosen.append(r)
+    chosen.sort()
+    return [_refine(prof, i, band) for i in chosen]
+
+
+# -------------------------------------------------------------------- detector
 class Detector:
-    """Bright-only background subtraction inside a world-derived ROI."""
-
     def __init__(self, geom):
         self.g = geom
-        self.bg = None                                  # full-frame blurred bg
+        self.bg_y = self.bg_u = self.bg_v = None
         self.mask = None
         self.mask_c = None
         self.bbox = (0, 0, geom.W, geom.H)
-        self._sig = None
+        self._roi_sig = None
+        self._lim_sig = None
+        self._lim = self._ymin = self._bgc = None
+        self._k_sig = None
+        self._ko = self._kc = None
+        self._bg_stamp = 0
+        self.dbg_cd = None                     # chroma-distance map (view mode 3)
 
-    # ------------------------------------------------------------ background
-    def set_background(self, frames, blur_k):
-        frames = [np.ascontiguousarray(f) for f in frames if f is not None]
-        if not frames:
-            print("[bg] no frames captured -- background unchanged")
-            return None
-        shp = frames[0].shape
-        frames = [f for f in frames if f.shape == shp]
-        if len(frames) < 2:
-            print("[bg] not enough consistent frames -- background unchanged")
-            return None
-        stack = np.stack(frames).astype(np.float32)
-        bg = np.median(stack, axis=0)
-        bg = np.clip(bg, 0, 255).astype(np.uint8)
-        k = _odd(blur_k)
-        self.bg = cv2.GaussianBlur(bg, (k, k), 0)
-        return self.bg
+    # ---------------- background ----------------
+    def set_background(self, frames, cfg):
+        ys = [f[0] for f in frames if f is not None and f[0] is not None]
+        if len(ys) < 2:
+            print("[bg] not enough frames -- background unchanged")
+            return False
+        shp = ys[0].shape
+        ys = [f for f in ys if f.shape == shp]
+        med = np.median(np.stack(ys), axis=0)
+        k = _odd(cfg["detect"]["blur_k"])
+        bg = np.clip(med, 0, 255).astype(np.uint8)
+        self.bg_y = cv2.blur(bg, (k, k)) if k > 1 else bg
+        us = [f[1] for f in frames if f is not None and f[1] is not None]
+        vs = [f[2] for f in frames if f is not None and f[2] is not None]
+        cshape = (shp[0] // 2, shp[1] // 2)
+        us = [a for a in us if a.shape == cshape]
+        vs = [a for a in vs if a.shape == cshape]
+        if len(us) >= 2 and len(vs) >= 2:
+            self.bg_u = cv2.blur(np.clip(np.median(np.stack(us), axis=0), 0, 255)
+                                 .astype(np.uint8), (3, 3))
+            self.bg_v = cv2.blur(np.clip(np.median(np.stack(vs), axis=0), 0, 255)
+                                 .astype(np.uint8), (3, 3))
+        else:
+            self.bg_u = self.bg_v = None
+            print("[bg] no chroma planes -- shadow rejection disabled")
+        self._bg_stamp += 1
+        self._lim_sig = None
+        return True
+
+    def save_background(self, path):
+        d = {"y": self.bg_y}
+        if self.bg_u is not None:
+            d["u"], d["v"] = self.bg_u, self.bg_v
+        np.savez(path, **d)
 
     def load_background(self, path):
         try:
-            bg = np.load(path)
+            if path.endswith(".npz"):
+                z = np.load(path)
+                y = z["y"]
+                u = z["u"] if "u" in z.files else None
+                v = z["v"] if "v" in z.files else None
+            else:
+                y, u, v = np.load(path), None, None
         except Exception as e:
             print(f"[bg] {path} unreadable ({e})")
             return False
-        if bg.ndim != 2 or bg.shape != (self.g.H, self.g.W):
-            print(f"[bg] {path} shape {bg.shape} != {(self.g.H, self.g.W)}; ignored")
+        if y.ndim != 2 or y.shape != (self.g.H, self.g.W):
+            print(f"[bg] {path} shape {y.shape} != {(self.g.H, self.g.W)}; ignored")
             return False
-        self.bg = np.ascontiguousarray(bg, dtype=np.uint8)
+        self.bg_y = np.ascontiguousarray(y, dtype=np.uint8)
+        cshape = (self.g.H // 2, self.g.W // 2)
+        self.bg_u = np.ascontiguousarray(u, np.uint8) if (u is not None and u.shape == cshape) else None
+        self.bg_v = np.ascontiguousarray(v, np.uint8) if (v is not None and v.shape == cshape) else None
+        self._bg_stamp += 1
+        self._lim_sig = None
         return True
 
-    # ------------------------------------------------------------------- ROI
+    # ---------------- ROI ----------------
     def rebuild_roi(self, cfg):
-        """Keep pixels whose ray pierces the play volume. Cached by signature."""
         d = cfg["detect"]
         bx0, bx1, by0, by1 = play_bounds(cfg)
         zmax = d["roi_zmax_cm"] / 100.0
@@ -73,9 +178,9 @@ class Detector:
                round(zmax, 4), round(self.g.yaw, 6), round(self.g.pitch, 6),
                round(self.g.roll, 6), round(self.g.f, 4),
                tuple(np.round(self.g.C, 6)))
-        if sig == self._sig:
+        if sig == self._roi_sig:
             return
-        self._sig = sig
+        self._roi_sig = sig
         vv, uu = np.mgrid[0:self.g.H, 0:self.g.W]
         dirs = self.g.dirs(uu.ravel(), vv.ravel())
         keep = np.zeros(dirs.shape[0], bool)
@@ -87,62 +192,130 @@ class Detector:
         mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
         ys, xs = np.nonzero(mask)
         if len(xs) < 100:
-            self.mask, self.mask_c = None, None
+            self.mask = self.mask_c = None
             self.bbox = (0, 0, self.g.W, self.g.H)
             print("[roi] EMPTY -- check camera pose / cutoff side")
             return
-        self.bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        x0, y0 = int(xs.min()), int(ys.min())
+        x1, y1 = int(xs.max()) + 1, int(ys.max()) + 1
+        x0 -= x0 % 2                                  # keep chroma sub-sampling exact
+        y0 -= y0 % 2
+        x1 = min(self.g.W, x1 + (x1 % 2))
+        y1 = min(self.g.H, y1 + (y1 % 2))
+        self.bbox = (x0, y0, x1, y1)
         self.mask = np.ascontiguousarray(mask)
-        x0, y0, x1, y1 = self.bbox
         self.mask_c = np.ascontiguousarray(mask[y0:y1, x0:x1])
+        self._lim_sig = None
         cov = 100.0 * len(xs) / (self.g.W * self.g.H)
         print(f"[roi] {cov:.0f}% of frame, bbox={self.bbox}")
 
-    # ---------------------------------------------------------------- detect
-    def detect(self, frame, cfg):
-        d = cfg["detect"]
-        if self.bg is None or self.mask_c is None or frame is None:
-            return [], None
-        if frame.shape != self.bg.shape:
-            return [], None
+    # ---------------- cached thresholds / kernels ----------------
+    def _update_limits(self, d):
+        sig = (int(d["diff_thresh"]), int(d["rel_thresh_pct"]),
+               int(d["shadow_ymin_pct"]), self.bbox, self._bg_stamp)
+        if sig == self._lim_sig:
+            return
+        self._lim_sig = sig
         x0, y0, x1, y1 = self.bbox
-        sub = frame[y0:y1, x0:x1]
-        bgc = self.bg[y0:y1, x0:x1]
+        bgc = np.ascontiguousarray(self.bg_y[y0:y1, x0:x1])
+        self._bgc = bgc
+        b16 = bgc.astype(np.uint16)
+        self._lim = np.clip(b16 * int(d["rel_thresh_pct"]) // 100
+                            + int(d["diff_thresh"]), 0, 255).astype(np.uint8)
+        self._ymin = np.clip(b16 * int(d["shadow_ymin_pct"]) // 100,
+                             0, 255).astype(np.uint8)
+
+    def _kernels(self, d):
+        sig = (int(d["open_k"]), int(d["close_k"]))
+        if sig == self._k_sig:
+            return
+        self._k_sig = sig
+        self._ko = (cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(d["open_k"]),) * 2)
+                    if int(d["open_k"]) > 1 else None)
+        self._kc = (cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(d["close_k"]),) * 2)
+                    if int(d["close_k"]) > 1 else None)
+
+    # ---------------- detection ----------------
+    def detect(self, fr, cfg):
+        d = cfg["detect"]
+        if fr is None or self.bg_y is None or self.mask_c is None:
+            return [], [], None
+        y, u, v = fr
+        if y is None or y.shape != self.bg_y.shape:
+            return [], [], None
+        x0, y0, x1, y1 = self.bbox
+        cur = y[y0:y1, x0:x1]
         k = _odd(d["blur_k"])
-        blur = cv2.GaussianBlur(sub, (k, k), 0)
-        diff = cv2.subtract(blur, bgc).astype(np.int16)   # shadows/dark legs -> 0
-        # per-pixel threshold: absolute + relative to local background brightness
-        lim = (bgc.astype(np.int16) * int(d["rel_thresh_pct"])) // 100
-        lim += int(d["diff_thresh"])
-        th = np.zeros(diff.shape, np.uint8)
-        th[diff > lim] = 255
-        th = cv2.bitwise_and(th, self.mask_c)
-        if int(d["open_k"]) > 1:
-            ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(d["open_k"]),) * 2)
-            th = cv2.morphologyEx(th, cv2.MORPH_OPEN, ko)
-        if int(d["close_k"]) > 1:
-            kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(d["close_k"]),) * 2)
-            th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kc)
-        blobs = []
-        for c in _contours(th):
-            a = float(cv2.contourArea(c))
-            if a < d["min_area"] or a > d["max_area"]:
+        if k > 1:
+            cur = cv2.blur(cur, (k, k))
+        self._update_limits(d)
+        self._kernels(d)
+
+        fg = cv2.compare(cur, self._lim, cv2.CMP_GT)          # brighter than bg
+        use_c = (int(d.get("use_chroma", 1)) and u is not None
+                 and self.bg_u is not None)
+        if use_c:
+            hx0, hy0, hx1, hy1 = x0 // 2, y0 // 2, x1 // 2, y1 // 2
+            du = cv2.absdiff(u[hy0:hy1, hx0:hx1], self.bg_u[hy0:hy1, hx0:hx1])
+            dv = cv2.absdiff(v[hy0:hy1, hx0:hx1], self.bg_v[hy0:hy1, hx0:hx1])
+            cd = cv2.resize(cv2.add(du, dv), (x1 - x0, y1 - y0),
+                            interpolation=cv2.INTER_NEAREST)
+            self.dbg_cd = cd
+            drop = cv2.subtract(self._bgc, cur)               # >0 where darker
+            dark = cv2.threshold(drop, float(d["dark_obj_thresh"]), 255,
+                                 cv2.THRESH_BINARY)[1]
+            chrom = cv2.threshold(cd, float(d["chroma_thresh"]), 255,
+                                  cv2.THRESH_BINARY)[1]
+            fg = cv2.bitwise_or(fg, chrom)                    # sock over wood
+            fg = cv2.bitwise_or(fg, dark)                     # dark objects
+            # shadow := darker, same hue as the floor, and not pitch black
+            flat = cv2.threshold(cd, float(d["shadow_chroma_tol"]), 255,
+                                 cv2.THRESH_BINARY_INV)[1]
+            lit = cv2.compare(cur, self._ymin, cv2.CMP_GT)
+            shadow = cv2.bitwise_and(dark, cv2.bitwise_and(flat, lit))
+            fg = cv2.bitwise_and(fg, cv2.bitwise_not(shadow))
+        else:
+            self.dbg_cd = None
+
+        fg = cv2.bitwise_and(fg, self.mask_c)
+        if self._ko is not None:
+            fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, self._ko)
+        if self._kc is not None:
+            fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self._kc)
+
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(fg, 8, cv2.CV_32S)
+        min_a, max_a = int(d["min_area"]), int(d["max_area"])
+        cands = [(int(stats[i, cv2.CC_STAT_AREA]), i) for i in range(1, n)
+                 if min_a <= int(stats[i, cv2.CC_STAT_AREA]) <= max_a]
+        cands.sort(reverse=True)
+        cands = cands[:max(1, int(d["max_blobs"]))]
+
+        comps, pts = [], []
+        for a, i in cands:
+            bx = int(stats[i, cv2.CC_STAT_LEFT])
+            by = int(stats[i, cv2.CC_STAT_TOP])
+            bw = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            sl = lab[by:by + bh, bx:bx + bw] == i
+            has = sl.any(axis=0)
+            prof = (bh - 1 - np.argmax(sl[::-1, :], axis=0)).astype(np.int32)
+            prof[~has] = -1
+            cs = _contacts(prof, d)
+            if not cs:
                 continue
-            p = c.reshape(-1, 2)
-            ymax = int(p[:, 1].max())
-            band = p[p[:, 1] >= ymax - max(1, int(d["band_px"]))]
-            # LOWEST POINT = floor contact point; median x is robust to spikes
-            lu = float(np.median(band[:, 0])) + x0
-            lv = float(ymax) + y0
-            blobs.append({"c": c, "off": (x0, y0), "area": a,
-                          "low": (lu, lv), "w": float(np.ptp(p[:, 0]))})
-        blobs.sort(key=lambda b: -b["area"])
-        return blobs[:int(d["max_blobs"])], th
+            ci = len(comps)
+            comps.append({"org": (bx + x0, by + y0), "wh": (bw, bh),
+                          "area": a, "prof": prof, "n": len(cs)})
+            for (cu, cvv) in cs:
+                pts.append({"low": (bx + x0 + cu, by + y0 + cvv),
+                            "area": float(a) / len(cs), "comp": ci,
+                            "w": float(bw)})
+        pts.sort(key=lambda b: -b["area"])
+        return pts[:max(1, int(d.get("max_points", 4)))], comps, fg
 
 
 # ------------------------------------------------------------------- stereo
 def stereo_feet(b0, b1, g0, g1, cfg, prev):
-    """Match blobs across cameras; returns (feet, used0, used1)."""
     d = cfg["detect"]
     bx0, bx1, by0, by1 = play_bounds(cfg)
     n0, n1 = len(b0), len(b1)
@@ -164,9 +337,8 @@ def stereo_feet(b0, b1, g0, g1, cfg, prev):
             z0 = g0.C[2] + t0 * math.tan(r0[i][1])
             z1 = g1.C[2] + t1 * math.tan(r1[j][1])
             c = abs(z0 - z1) * 1000.0
-            if prev:                                   # temporal continuity
-                c += d["w_track"] * 1000.0 * min(float(np.linalg.norm(P - p))
-                                                 for p in prev)
+            if prev:
+                c += d["w_track"] * 1000.0 * min(float(np.linalg.norm(P - p)) for p in prev)
             cost[i, j] = c
             cand[(i, j)] = {"pos": P, "z_mm": (z0 + z1) * 500.0,
                             "z0_mm": z0 * 1000.0, "z1_mm": z1 * 1000.0, "mono": False}
@@ -187,33 +359,30 @@ def stereo_feet(b0, b1, g0, g1, cfg, prev):
     return feet, {a for a, _ in best}, {b for _, b in best}
 
 
-def mono_feet(blobs, used, g, cfg, cov_mono):
-    """Unmatched blob -> assume contact, intersect lowest-point ray with the floor."""
+def mono_feet(points, used, g, cfg, cov_mono):
     d = cfg["detect"]
     if not d["mono_enable"]:
         return []
     bx0, bx1, by0, by1 = play_bounds(cfg, margin_cm=0)
     out = []
-    for i, b in enumerate(blobs):
+    for i, b in enumerate(points):
         if i in used:
             continue
         P, ok = g.plane_hit(np.asarray(g.dirs(*b["low"])).reshape(3))
         if not ok:
             continue
-        x, y = float(P[0]), float(P[1])
-        if not (bx0 <= x <= bx1 and by0 <= y <= by1):
-            continue                                   # hovering feet land far outside
-        if cov_mono is not None and not cov_mono(x, y):
-            continue                                   # stereo region: trust stereo only
-        out.append({"pos": np.array([x, y]), "z_mm": 0.0,
+        x, yy = float(P[0]), float(P[1])
+        if not (bx0 <= x <= bx1 and by0 <= yy <= by1):
+            continue
+        if cov_mono is not None and not cov_mono(x, yy):
+            continue
+        out.append({"pos": np.array([x, yy]), "z_mm": 0.0,
                     "z0_mm": 0.0, "z1_mm": 0.0, "mono": True})
     return out
 
 
 # ----------------------------------------------------------------- coverage
 class Coverage:
-    """Floor grid -> 0 dead / 1 mono / 2 stereo. Also gates the mono fallback."""
-
     def __init__(self, g0, g1, cfg, step=0.01, quiet=False):
         w, dp = cfg["board"]["width_m"], cfg["board"]["depth_m"]
         self.step, self.w, self.dp = step, w, dp
@@ -234,8 +403,7 @@ class Coverage:
                   f"stereo {self.pct[2]:.0f}%")
 
     def is_mono(self, x, y):
-        iy = int(round(y / self.step))
-        ix = int(round(x / self.step))
+        iy, ix = int(round(y / self.step)), int(round(x / self.step))
         if not (0 <= iy < self.ny and 0 <= ix < self.nx):
             return False
         return self.map[iy, ix] <= 1

@@ -1,5 +1,5 @@
 """
-ui.py -- sliders, draggable 4-pane layout, top-down map, raw-stdin key reader.
+ui.py -- sliders, draggable layout, cached overlays, mirrored top-down view.
 """
 import math
 import select
@@ -8,7 +8,7 @@ import sys
 import cv2
 import numpy as np
 
-from boardmap import cutoff_m, zone_enabled
+from boardmap import cutoff_m, zone_enabled, zone_signature
 
 try:
     import termios
@@ -17,8 +17,15 @@ try:
 except ImportError:
     HAVE_TTY = False
 
+VIEW_NAMES = ("gray", "diff", "mask", "chroma")
 
-# ------------------------------------------------------------------ helpers
+
+def pose_sig(g):
+    return (round(g.yaw, 6), round(g.pitch, 6), round(g.roll, 6), round(g.f, 4),
+            round(float(g.C[0]), 6), round(float(g.C[1]), 6), round(float(g.C[2]), 6))
+
+
+# ------------------------------------------------------------------ sliders
 def cfg_get(cfg, path):
     node = cfg
     for p in path:
@@ -37,17 +44,29 @@ def _H(t):
     return (t, None, 0, 0, 0, 0, 1.0)
 
 
-# name, cfg path, lo, hi, step, decimals, unit (cfg value = slider value * unit)
 SLIDERS = [
-    _H("- DETECT -"),
+    _H("- LUMA -"),
     ("Diff thresh",    ("detect", "diff_thresh"),      1, 120, 1, 0, 1.0),
     ("Rel thresh %",   ("detect", "rel_thresh_pct"),   0, 40, 1, 0, 1.0),
     ("Blur k",         ("detect", "blur_k"),           1, 15, 2, 0, 1.0),
+    _H("- CHROMA / SHADOW -"),
+    ("Use chroma",     ("detect", "use_chroma"),       0, 1, 1, 0, 1.0),
+    ("Chroma thr",     ("detect", "chroma_thresh"),    2, 60, 1, 0, 1.0),
+    ("Shadow UV tol",  ("detect", "shadow_chroma_tol"), 1, 40, 1, 0, 1.0),
+    ("Shadow Ymin %",  ("detect", "shadow_ymin_pct"),  5, 90, 1, 0, 1.0),
+    ("Dark obj thr",   ("detect", "dark_obj_thresh"),  5, 120, 1, 0, 1.0),
+    _H("- BLOBS / SPLIT -"),
     ("Open k",         ("detect", "open_k"),           1, 15, 2, 0, 1.0),
     ("Close k",        ("detect", "close_k"),          1, 25, 2, 0, 1.0),
     ("Min area px",    ("detect", "min_area"),        20, 4000, 10, 0, 1.0),
-    ("Max area px",    ("detect", "max_area"),      1000, 60000, 500, 0, 1.0),
+    ("Max area px",    ("detect", "max_area"),      1000, 90000, 500, 0, 1.0),
     ("Band px",        ("detect", "band_px"),          1, 15, 1, 0, 1.0),
+    ("Prof smooth px", ("detect", "prof_smooth_px"),   1, 31, 2, 0, 1.0),
+    ("Split prom px",  ("detect", "split_min_prom_px"), 1, 40, 1, 0, 1.0),
+    ("Split sep px",   ("detect", "split_min_sep_px"), 4, 150, 1, 0, 1.0),
+    ("Max contacts",   ("detect", "max_contacts"),     1, 2, 1, 0, 1.0),
+    ("Max blobs",      ("detect", "max_blobs"),        1, 6, 1, 0, 1.0),
+    ("Max points",     ("detect", "max_points"),       1, 6, 1, 0, 1.0),
     _H("- GATES / TIMING -"),
     ("Contact mm",     ("detect", "z_contact_mm"),     0, 80, 1, 0, 1.0),
     ("Pair tol mm",    ("detect", "z_pair_tol_mm"),    5, 200, 5, 0, 1.0),
@@ -75,7 +94,10 @@ SLIDERS = [
     ("Roll c1 deg",    ("cameras", "cam1", "roll_deg"),       -8.0, 8.0, 0.05, 2, 1.0),
     ("Cam0 height mm", ("cameras", "cam0", "pos_m", 2),       30.0, 150.0, 0.5, 1, 0.001),
     ("Cam1 height mm", ("cameras", "cam1", "pos_m", 2),       30.0, 150.0, 0.5, 1, 0.001),
-    _H("- MIDI -"),
+    _H("- UI / MIDI -"),
+    ("Draw every N",   ("ui", "draw_every"),           1, 6, 1, 0, 1.0),
+    ("Topdown mirror", ("view", "topdown_mirror"),     0, 1, 1, 0, 1.0),
+    ("Topdown px",     ("ui", "topdown_px"),         320, 1100, 20, 0, 1.0),
     ("Vel min",        ("midi", "vel_min"),            1, 127, 1, 0, 1.0),
     ("Vel max",        ("midi", "vel_max"),            1, 127, 1, 0, 1.0),
 ]
@@ -96,7 +118,6 @@ def sl_set(cfg, spec, v):
         cfg_set(cfg, FOV_LINKS[spec[0]], round(v, 3))
 
 
-# -------------------------------------------------------------------- panel
 class Panel:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -107,7 +128,7 @@ class Panel:
     def draw(self, w, h):
         w, h = max(40, w), max(40, h)
         img = np.full((h, w, 3), 26, np.uint8)
-        rh, top = 24, 4
+        rh, top = 22, 4
         cap = max(1, (h - top) // rh)
         ncol = max(1, int(math.ceil(len(SLIDERS) / cap)))
         cw = w // ncol
@@ -119,25 +140,25 @@ class Panel:
                 continue
             name, path, lo, hi, step, dec, unit = spec
             if path is None:
-                cv2.putText(img, name, (x, y + 15), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.36, (120, 160, 255), 1, cv2.LINE_AA)
+                cv2.putText(img, name, (x, y + 14), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.34, (120, 160, 255), 1, cv2.LINE_AA)
                 continue
             bw = max(10, cw - 12)
             val = sl_get(self.cfg, spec)
             fr = (val - lo) / float(hi - lo)
             sel = (i == self.sel)
-            cv2.rectangle(img, (x, y + 13), (x + bw, y + 20), (55, 55, 55), -1)
-            if lo < 0 < hi:                                # bipolar: centre tick
+            cv2.rectangle(img, (x, y + 12), (x + bw, y + 18), (55, 55, 55), -1)
+            if lo < 0 < hi:
                 zx = x + int(bw * (-lo) / (hi - lo))
-                cv2.rectangle(img, (min(zx, x + int(bw * fr)), y + 13),
-                              (max(zx, x + int(bw * fr)), y + 20),
+                cv2.rectangle(img, (min(zx, x + int(bw * fr)), y + 12),
+                              (max(zx, x + int(bw * fr)), y + 18),
                               (0, 190, 255) if sel else (0, 120, 170), -1)
-                cv2.line(img, (zx, y + 11), (zx, y + 22), (150, 150, 150), 1)
+                cv2.line(img, (zx, y + 10), (zx, y + 20), (150, 150, 150), 1)
             else:
-                cv2.rectangle(img, (x, y + 13), (x + int(bw * fr), y + 20),
+                cv2.rectangle(img, (x, y + 12), (x + int(bw * fr), y + 18),
                               (0, 190, 255) if sel else (0, 120, 170), -1)
-            cv2.putText(img, f"{name}: {val:.{dec}f}", (x, y + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+            cv2.putText(img, f"{name}: {val:.{dec}f}", (x, y + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34,
                         (255, 255, 120) if sel else (200, 200, 200), 1, cv2.LINE_AA)
             self.rows.append((i, x, y, bw, rh))
         return img
@@ -176,7 +197,6 @@ class Panel:
 
 # ------------------------------------------------------------------- layout
 class Layout:
-    """4 panes / 3 draggable boundaries, single fullscreen canvas."""
     GRAB = 7
 
     def __init__(self, cfg, panel):
@@ -231,13 +251,12 @@ def blit(dst, rect, img, pad=2):
         return
     s = min(w / img.shape[1], h / img.shape[0])
     nw, nh = max(1, int(img.shape[1] * s)), max(1, int(img.shape[0] * s))
-    r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_NEAREST)
     ox, oy = x0 + (w - nw) // 2, y0 + (h - nh) // 2
     dst[oy:oy + nh, ox:ox + nw] = r
 
 
 def txt(img, s, org, scale_ref=None, rel=0.032, col=(0, 255, 255), thick=None):
-    """Font size proportional to image height -> readable at any pane size."""
     h = (scale_ref or img).shape[0]
     fs = max(0.32, rel * h / 12.0)
     th = thick or max(1, int(round(fs * 1.6)))
@@ -245,48 +264,130 @@ def txt(img, s, org, scale_ref=None, rel=0.032, col=(0, 255, 255), thick=None):
     cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, fs, col, th, cv2.LINE_AA)
 
 
-def draw_topdown(cfg, zones, active, feet, cov, show_cov, px=900):
-    w, dp = cfg["board"]["width_m"], cfg["board"]["depth_m"]
-    sc = px / w
-    W, H = int(w * sc), int(dp * sc) + 40
-    img = np.full((H, W, 3), 22, np.uint8)
-    if show_cov and cov is not None:
-        img[:int(dp * sc), :] = cov.image(W, int(dp * sc))
-    for z in zones:
-        pts = (z["poly"].reshape(-1, 2) * sc).astype(np.int32)
-        on = zone_enabled(z, cfg)
-        if z["midi"] in active:
-            cv2.fillPoly(img, [pts], (0, 200, 0))
-        elif z["black"]:
-            cv2.fillPoly(img, [pts], (45, 45, 45) if on else (30, 20, 20))
-        edge = ((120, 120, 120) if not z["black"] else (90, 90, 160)) if on else (40, 40, 60)
-        cv2.polylines(img, [pts], True, edge, 1)
-    cut = int(cutoff_m(cfg) * sc)
-    cv2.line(img, (cut, 0), (cut, int(dp * sc)), (0, 0, 220), 2)
-    arrow = -30 if cfg["limits"].get("cutoff_low_side") else 30
-    cv2.arrowedLine(img, (cut, 14), (cut + arrow, 14), (0, 0, 220), 2, tipLength=0.4)
-    for name, col in (("cam0", (255, 180, 0)), ("cam1", (255, 120, 255))):
-        c = cfg["cameras"][name]
-        p = (int(c["pos_m"][0] * sc), int(c["pos_m"][1] * sc))
-        cv2.circle(img, p, 6, col, -1)
-        yaw, hf = math.radians(c["yaw_deg"]), math.radians(c["hfov_deg"]) / 2
-        for a in (yaw - hf, yaw + hf):
-            cv2.line(img, p, (int(p[0] + 2.0 * sc * math.cos(a)),
-                              int(p[1] + 2.0 * sc * math.sin(a))), col, 1)
-    for f in feet:
-        x, y = int(f["pos"][0] * sc), int(f["pos"][1] * sc)
-        con = f["mono"] or f["z_mm"] < cfg["detect"]["z_contact_mm"]
-        cv2.circle(img, (x, y), 10, (0, 0, 255) if con else (0, 220, 255), -1 if con else 2)
-        txt(img, f"{'M' if f['mono'] else ''}{f['z_mm']:.0f}mm", (x + 12, y + 4),
-            col=(255, 255, 255), rel=0.022)
-    names = ",".join(sorted(z["note"] for z in zones if z["midi"] in active))
-    txt(img, f"ACTIVE: {names}", (8, H - 12), rel=0.028, col=(0, 255, 120))
-    if len(feet) == 1 and not feet[0]["mono"]:
-        f = feet[0]
-        txt(img, f"z0 {f['z0_mm']:+6.1f}  z1 {f['z1_mm']:+6.1f}  "
-                 f"d {f['z0_mm'] - f['z1_mm']:+6.1f} mm", (8, H - 34),
-            rel=0.028, col=(255, 200, 0))
-    return img
+# ----------------------------------------------------- cached camera overlay
+class ZoneOverlay:
+    """Projected key outlines; rebuilt only when pose / zones / cutoff change."""
+
+    def __init__(self):
+        self._sig = None
+        self.items = []
+
+    def update(self, cfg, zones, geom, scale):
+        sig = (zone_signature(cfg), cfg["limits"]["x_cutoff_cm"],
+               int(cfg["limits"]["cutoff_low_side"]), pose_sig(geom), round(scale, 5))
+        if sig == self._sig:
+            return
+        self._sig = sig
+        items = []
+        for z in zones:
+            if not zone_enabled(z, cfg):
+                continue
+            pp = [geom.project((float(p[0]), float(p[1]), 0.0))
+                  for p in z["poly"].reshape(-1, 2)]
+            if any(p is None for p in pp):
+                continue
+            pts = (np.asarray(pp) * scale).astype(np.int32).reshape(-1, 1, 2)
+            items.append((z["midi"], pts, z["black"]))
+        self.items = items
+
+    def draw(self, vis, active):
+        for midi, pts, black in self.items:
+            c = (0, 200, 0) if midi in active else ((90, 90, 160) if black else (70, 70, 70))
+            cv2.polylines(vis, [pts], True, c, 1)
+
+
+# ----------------------------------------------------------- top-down view
+class TopDown:
+    """Static layer (zones/cameras/coverage) cached; only feet+actives per frame."""
+
+    def __init__(self):
+        self._sig = None
+        self.base = None
+        self.polys = {}
+        self.W = self.H = 0
+        self.sc = 1.0
+        self.mirror = True
+
+    def _x(self, xm):
+        return int(round((self.W - 1 - xm * self.sc) if self.mirror else xm * self.sc))
+
+    def _y(self, ym):
+        return int(round(ym * self.sc))
+
+    def _sigof(self, cfg, cov, show_cov, px):
+        cams = tuple((tuple(cfg["cameras"][n]["pos_m"]), cfg["cameras"][n]["yaw_deg"],
+                      cfg["cameras"][n]["hfov_deg"]) for n in ("cam0", "cam1"))
+        return (zone_signature(cfg), cfg["limits"]["x_cutoff_cm"],
+                int(cfg["limits"]["cutoff_low_side"]),
+                int(cfg["view"].get("topdown_mirror", 1)), int(px), bool(show_cov),
+                id(cov) if show_cov else 0, cams)
+
+    def _rebuild(self, cfg, zones, cov, show_cov, px):
+        w, dp = cfg["board"]["width_m"], cfg["board"]["depth_m"]
+        self.mirror = bool(cfg["view"].get("topdown_mirror", 1))
+        self.sc = px / w
+        self.W, self.H = int(w * self.sc), int(dp * self.sc) + 40
+        img = np.full((self.H, self.W, 3), 22, np.uint8)
+        bh = int(dp * self.sc)
+        if show_cov and cov is not None:
+            ci = cov.image(self.W, bh)
+            img[:bh, :] = cv2.flip(ci, 1) if self.mirror else ci
+        self.polys = {}
+        for z in zones:
+            v = z["poly"].reshape(-1, 2)
+            pts = np.array([[self._x(p[0]), self._y(p[1])] for p in v], np.int32)
+            self.polys[z["midi"]] = pts
+            on = zone_enabled(z, cfg)
+            if z["black"]:
+                cv2.fillPoly(img, [pts], (45, 45, 45) if on else (30, 20, 20))
+            edge = ((120, 120, 120) if not z["black"] else (90, 90, 160)) if on else (40, 40, 60)
+            cv2.polylines(img, [pts], True, edge, 1)
+        cx = self._x(cutoff_m(cfg))
+        cv2.line(img, (cx, 0), (cx, bh), (0, 0, 220), 2)
+        dead = -1 if cfg["limits"].get("cutoff_low_side") else 1
+        if self.mirror:
+            dead = -dead
+        cv2.arrowedLine(img, (cx, 14), (cx + 30 * dead, 14), (0, 0, 220), 2, tipLength=0.4)
+        for name, col in (("cam0", (255, 180, 0)), ("cam1", (255, 120, 255))):
+            c = cfg["cameras"][name]
+            p = (self._x(c["pos_m"][0]), self._y(c["pos_m"][1]))
+            cv2.circle(img, p, 6, col, -1)
+            yaw, hf = math.radians(c["yaw_deg"]), math.radians(c["hfov_deg"]) / 2
+            for a in (yaw - hf, yaw + hf):
+                dx = 2.0 * self.sc * math.cos(a)
+                dy = 2.0 * self.sc * math.sin(a)
+                cv2.line(img, p, (int(p[0] - dx if self.mirror else p[0] + dx),
+                                  int(p[1] + dy)), col, 1)
+        txt(img, "MIRRORED" if self.mirror else "", (self.W - 130, 18),
+            rel=0.022, col=(120, 120, 120))
+        self.base = img
+
+    def render(self, cfg, zones, active, feet, cov, show_cov, px=720):
+        sig = self._sigof(cfg, cov, show_cov, px)
+        if sig != self._sig or self.base is None:
+            self._sig = sig
+            self._rebuild(cfg, zones, cov, show_cov, px)
+        img = self.base.copy()
+        for m in active:
+            pts = self.polys.get(m)
+            if pts is not None:
+                cv2.fillPoly(img, [pts], (0, 200, 0))
+                cv2.polylines(img, [pts], True, (0, 255, 120), 1)
+        for f in feet:
+            x, y = self._x(float(f["pos"][0])), self._y(float(f["pos"][1]))
+            con = f["mono"] or f["z_mm"] < cfg["detect"]["z_contact_mm"]
+            cv2.circle(img, (x, y), 10, (0, 0, 255) if con else (0, 220, 255),
+                       -1 if con else 2)
+            txt(img, f"{'M' if f['mono'] else ''}{f['z_mm']:.0f}mm", (x + 12, y + 4),
+                col=(255, 255, 255), rel=0.022)
+        names = ",".join(sorted(z["note"] for z in zones if z["midi"] in active))
+        txt(img, f"ACTIVE: {names}", (8, self.H - 12), rel=0.028, col=(0, 255, 120))
+        if len(feet) == 1 and not feet[0]["mono"]:
+            f = feet[0]
+            txt(img, f"z0 {f['z0_mm']:+6.1f}  z1 {f['z1_mm']:+6.1f}  "
+                     f"d {f['z0_mm'] - f['z1_mm']:+6.1f} mm", (8, self.H - 34),
+                rel=0.028, col=(255, 200, 0))
+        return img
 
 
 # ---------------------------------------------------------------------- keys
@@ -296,7 +397,7 @@ class KeyReader:
         if HAVE_TTY and sys.stdin.isatty():
             self.fd = sys.stdin.fileno()
             self.old = termios.tcgetattr(self.fd)
-            tty.setcbreak(self.fd)          # cbreak keeps Ctrl-C alive
+            tty.setcbreak(self.fd)
 
     def get(self):
         if self.fd is None:
@@ -314,8 +415,8 @@ def help_text():
     return """
  q quit (config saved)   b snapshot background (AREA EMPTY)   s save config now
  l landmark calibration  SPACE grab landmark                  r reload note JSONs
- v cycle camera view (gray / diff / mask)      o overlay note boxes
- c toggle coverage map   x cutoff := cam1 x    k flip cut-off side
- i mirror note boxes in X                      m MIDI mute/unmute
- [ ] select slider   - = nudge   _ + nudge x10  ? this help
+ v cycle view: gray / diff / mask / chroma     o overlay note boxes
+ c coverage map   x cutoff := cam1 x   k flip cut-off side
+ i mirror note boxes X   t mirror top-down view   u chroma on/off   m MIDI mute
+ [ ] select slider   - = nudge   _ + nudge x10   ? this help
 """
