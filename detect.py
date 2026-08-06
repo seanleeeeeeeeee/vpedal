@@ -110,7 +110,7 @@ class Detector:
         self._ko = self._kc = None
         self._bg_stamp = 0
         self.dbg_cd = None                     # chroma-distance map (view mode 3)
-
+        self.chroma_state = "not run yet"
     # ---------------- background ----------------
     def set_background(self, frames, cfg):
         ys = [f[0] for f in frames if f is not None and f[0] is not None]
@@ -254,6 +254,14 @@ class Detector:
         fg = cv2.compare(cur, self._lim, cv2.CMP_GT)          # brighter than bg
         use_c = (int(d.get("use_chroma", 1)) and u is not None
                  and self.bg_u is not None)
+        if not int(d.get("use_chroma", 1)):
+            self.chroma_state = "disabled (press u)"
+        elif u is None:
+            self.chroma_state = "camera sends no U/V"
+        elif self.bg_u is None:
+            self.chroma_state = "background has no U/V (press b)"
+        else:
+            self.chroma_state = "ok"
         if use_c:
             hx0, hy0, hx1, hy1 = x0 // 2, y0 // 2, x1 // 2, y1 // 2
             du = cv2.absdiff(u[hy0:hy1, hx0:hx1], self.bg_u[hy0:hy1, hx0:hx1])

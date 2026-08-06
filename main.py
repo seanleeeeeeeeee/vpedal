@@ -151,18 +151,40 @@ class App:
         if det.mask is not None:
             mm = cv2.resize(det.mask, self.ds, interpolation=cv2.INTER_NEAREST)
             vis[mm == 0] = vis[mm == 0] // 3
-        if self.view in (2, 3):
-            layer = self.masks[i] if self.view == 2 else det.dbg_cd
+        if self.view == 3:                                   # chroma distance map
+            cd = det.dbg_cd
+            x0, y0, x1, y1 = det.bbox
+            if cd is None or cd.shape != (y1 - y0, x1 - x0):
+                vis = vis // 3
+                ui.txt(vis, "NO CHROMA: " + det.chroma_state, (6, 40),
+                       rel=0.034, col=(0, 120, 255))
+                ui.txt(vis, f"cam{i} {ui.VIEW_NAMES[self.view]}", (6, 16), rel=0.030)
+                return vis
+            full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
+            full[y0:y1, x0:x1] = cd
+            gain = float(cfg["ui"].get("chroma_gain", 6))
+            amp = cv2.resize(cv2.convertScaleAbs(full, alpha=gain), self.ds,
+                             interpolation=cv2.INTER_NEAREST)
+            vis = cv2.applyColorMap(amp, cv2.COLORMAP_INFERNO)
+            over = cv2.resize(cv2.threshold(full, float(cfg["detect"]["chroma_thresh"]),
+                                            255, cv2.THRESH_BINARY)[1],
+                              self.ds, interpolation=cv2.INTER_NEAREST)
+            vis[over > 0] = (0, 255, 0)                      # what counts as "object"
+            if det.mask is not None:
+                mm = cv2.resize(det.mask, self.ds, interpolation=cv2.INTER_NEAREST)
+                vis[mm == 0] = vis[mm == 0] // 3
+            ui.txt(vis, f"cam{i} chroma  gain x{gain:.0f}  thr "
+                        f"{cfg['detect']['chroma_thresh']}", (6, 16), rel=0.030)
+            return vis
+        if self.view == 2:                                   # binary foreground
+            layer = self.masks[i]
             if layer is not None:
                 full = np.zeros((self.ps[1], self.ps[0]), np.uint8)
                 x0, y0, x1, y1 = det.bbox
                 if layer.shape == (y1 - y0, x1 - x0):
                     full[y0:y1, x0:x1] = layer
                     lr = cv2.resize(full, self.ds, interpolation=cv2.INTER_NEAREST)
-                    if self.view == 2:
-                        vis[lr > 0] = (0, 90, 0)
-                    else:
-                        vis[..., 2] = np.maximum(vis[..., 2], lr)
+                    vis[lr > 0] = (0, 200, 0)
         if self.overlay:
             self.ov[i].update(cfg, self.zones, geom, self.scale)
             self.ov[i].draw(vis, self.engine.active)

@@ -57,6 +57,7 @@ DEFAULT_CFG = {
               "mirror_x": 1, "mirror_y": 0},
     "midi": {"channel": 0, "vel_min": 45, "vel_max": 120, "vel_gain": 250.0},
     "layout": {"hsplit": 0.60, "vsplit": 0.50, "bsplit": 0.62},
+    "ui": {"draw_every": 1, "topdown_px": 720, "cv_threads": 2, "chroma_gain": 6},
     "landmarks_m": [[0.04, 0.05], [1.26, 0.05], [1.26, 0.61], [0.04, 0.61],
                     [0.65, 0.33], [0.65, 0.60]]
 }
